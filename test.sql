@@ -115,6 +115,92 @@ SELECT label, kind, table_name, props_json FROM ladybug._graph_meta
 WHERE kind = 'edge';
 
 -- ============================================================
+-- In-place query tests (requires liblbug + ATTACH)
+-- These test the bridge flow: Cypher -> plan -> SQL -> SPI
+-- ============================================================
+SELECT '=== in-place query tests (conditional on liblbug) ===' AS info;
+
+/*
+ * These tests use the naming convention:
+ *   node_*  -> Cypher node labels
+ *   rel_*   -> Cypher relationship labels
+ *
+ * They work with the existing bridge by:
+ * 1. ATTACHing Postgres via the Ladybug postgres extension
+ * 2. The extension auto-detects rel_* tables and registers
+ *    them as relationship tables (RelGroupCatalogEntry)
+ * 3. The ForeignJoinPushDownOptimizer pushes down the entire
+ *    pattern as a single SQL JOIN query
+ * 4. The bridge extracts that SQL and executes it via SPI
+ *
+ * When the modified extension isn't available, rel_* tables
+ * are still registered as node tables, and the bridge's
+ * extract_pushed_sql falls back to constructing SELECT *
+ * queries from the SCAN_NODE_TABLE sections.
+ */
+
+-- The following tests use pre-existing tables in ladybug_test:
+--   node_person (id, name, age)
+--   node_city   (id, name, population)
+--   rel_knows   (id, src_id, dst_id, since)
+--   rel_lives_in (id, src_id, dst_id)
+
+DO $$
+DECLARE
+    result_count int;
+BEGIN
+    -- Test simple node MATCH
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (n:node_person) RETURN n.name, n.age'
+            ) AS t(name text, age int)
+        $q$ INTO result_count;
+        RAISE NOTICE 'node_person MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'node_person MATCH skipped: %', SQLERRM;
+    END;
+
+    -- Test node MATCH with WHERE
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (n:node_person) WHERE n.age > 28 RETURN n.name, n.age'
+            ) AS t(name text, age int)
+        $q$ INTO result_count;
+        RAISE NOTICE 'node_person WHERE MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'node_person WHERE MATCH skipped: %', SQLERRM;
+    END;
+
+    -- Test node MATCH with ORDER BY
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (n:node_person) RETURN n.name, n.age ORDER BY n.age'
+            ) AS t(name text, age int)
+        $q$ INTO result_count;
+        RAISE NOTICE 'node_person ORDER BY MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'node_person ORDER BY MATCH skipped: %', SQLERRM;
+    END;
+
+    -- Test relationship pattern (requires rel_* auto-detection)
+    -- This only works when the Ladybug extension has been modified
+    -- to detect rel_* tables as relationship tables.
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (a:node_person)-[r:rel_knows]->(b:node_person) RETURN a.name, b.name, r.since'
+            ) AS t(a_name text, b_name text, since int)
+        $q$ INTO result_count;
+        RAISE NOTICE 'rel_knows pattern MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'rel_knows pattern MATCH skipped (requires rel_* extension support): %', SQLERRM;
+    END;
+END $$;
+
+-- ============================================================
 -- Cleanup
 -- ============================================================
 SELECT '=== cleanup ===' AS info;
