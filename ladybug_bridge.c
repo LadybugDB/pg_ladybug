@@ -314,17 +314,22 @@ extract_pushed_sql(const char *plan_text)
 
     /*
      * Second pass: no "Function:" section found.  Construct a simple
-     * SELECT * FROM <table> [ORDER BY ...].  Column ordering is handled
-     * by name-based mapping in pg_ladybug.c.
+     * SELECT * FROM <table> [WHERE <conditions>] [ORDER BY ...].
+     * Column ordering is handled by name-based mapping in pg_ladybug.c.
      */
     {
         StringInfoData from_table;
+        StringInfoData where_clause;
         StringInfoData order_by;
         initStringInfo(&from_table);
+        initStringInfo(&where_clause);
         initStringInfo(&order_by);
 
         bool order_first = true;
         bool got_order_by = false;
+        bool in_filter = false;
+        StringInfoData filter_text;
+        initStringInfo(&filter_text);
 
         const char *line_start = plan_text;
         while (line_start && *line_start)
@@ -337,6 +342,36 @@ extract_pushed_sql(const char *plan_text)
             if (cleaned[0] != '\0')
             {
                 char *uc = cleaned;
+
+                /* Detect FILTER operator start */
+                if (strstr(uc, "FILTER[") != NULL ||
+                    strstr(uc, "FILTER [") != NULL)
+                {
+                    in_filter = true;
+                }
+                else if (in_filter)
+                {
+                    /* Collect filter content until we hit a known section */
+                    if (strstr(uc, "NumOutputTuples:") != NULL ||
+                        strstr(uc, "ExecutionTime:") != NULL ||
+                        strstr(uc, "Tables:") != NULL ||
+                        strstr(uc, "Order By:") != NULL ||
+                        strstr(uc, "Expressions:") != NULL ||
+                        strstr(uc, "SCAN_") != NULL ||
+                        strstr(uc, "PROJECTION") != NULL ||
+                        strstr(uc, "EXTEND") != NULL ||
+                        strstr(uc, "HASH_JOIN") != NULL)
+                    {
+                        in_filter = false;
+                    }
+                    else
+                    {
+                        /* Accumulate filter text */
+                        if (filter_text.len > 0)
+                            appendStringInfoChar(&filter_text, ' ');
+                        appendStringInfoString(&filter_text, uc);
+                    }
+                }
 
                 /* Extract table name from "Tables: <name>" */
                 if (strstr(uc, "Tables:") != NULL)
@@ -383,9 +418,115 @@ extract_pushed_sql(const char *plan_text)
             line_start = line_end ? line_end + 1 : NULL;
         }
 
+        /* Convert accumulated filter text to WHERE clause */
+        if (filter_text.len > 0)
+        {
+            char *fp = filter_text.data;
+            char *where_result = NULL;
+
+            /* Map function name to SQL operator */
+            const char *op = NULL;
+            if (strstr(fp, "GREATER_THAN_EQUALS") || strstr(fp, "GREATER_EQUALS"))
+                op = ">=";
+            else if (strstr(fp, "GREATER_THAN"))
+                op = ">";
+            else if (strstr(fp, "LESS_THAN_EQUALS") || strstr(fp, "LESS_EQUALS"))
+                op = "<=";
+            else if (strstr(fp, "LESS_THAN"))
+                op = "<";
+            else if (strstr(fp, "NOT_EQUALS"))
+                op = "<>";
+            else if (strstr(fp, "EQUALS") || strstr(fp, "EQUALS_TO"))
+                op = "=";
+
+            if (op != NULL)
+            {
+                /* Extract the inner content between the outermost parens */
+                char *open_paren = strchr(fp, '(');
+                char *close_paren = strrchr(fp, ')');
+                if (open_paren && close_paren && close_paren > open_paren)
+                {
+                    size_t inner_len = close_paren - open_paren - 1;
+                    char *inner = pnstrdup(open_paren + 1, inner_len);
+
+                    /* Now inner contains something like "CAST(n.age) 28" */
+                    /* Remove CAST() wrappers */
+                    char *clean = pstrdup(inner);
+                    {
+                        /* Simple approach: remove CAST(...) */
+                        char *src = inner;
+                        char *dst = clean;
+                        while (*src)
+                        {
+                            if (strncmp(src, "CAST(", 5) == 0)
+                            {
+                                src += 5;
+                                int d = 1;
+                                while (*src && d > 0)
+                                {
+                                    if (*src == '(') d++;
+                                    if (*src == ')') d--;
+                                    if (d > 0) { *dst = *src; dst++; src++; }
+                                    else { src++; }
+                                }
+                            }
+                            else
+                            {
+                                *dst = *src;
+                                dst++;
+                                src++;
+                            }
+                        }
+                        *dst = '\0';
+                    }
+
+                    /* Now clean contains something like "n.age 28" */
+                    /* Split by spaces to get left and right operands */
+                    char *left_s = clean;
+                    while (*left_s == ' ') left_s++;
+                    char *mid_s = left_s;
+                    while (*mid_s && *mid_s != ' ') mid_s++;
+                    if (*mid_s == ' ')
+                    {
+                        *mid_s = '\0';
+                        mid_s++;
+                        while (*mid_s == ' ') mid_s++;
+                        char *right_s = mid_s;
+                        /* Strip trailing parens or spaces */
+                        size_t rl = strlen(right_s);
+                        while (rl > 0 && (right_s[rl-1] == ')' || right_s[rl-1] == ' '))
+                            right_s[--rl] = '\0';
+
+                        /* Strip alias prefix */
+                        char *l = left_s;
+                        char *dot = strchr(l, '.');
+                        if (dot) l = dot + 1;
+
+                        where_result = psprintf("%s %s %s", l, op, right_s);
+                    }
+                    pfree(inner);
+                    pfree(clean);
+                }
+            }
+
+            if (where_result != NULL)
+            {
+                appendStringInfoString(&where_clause, where_result);
+                pfree(where_result);
+            }
+            else
+            {
+                /* Fallback: use raw filter text */
+                appendStringInfoString(&where_clause, fp);
+            }
+        }
+
+        pfree(filter_text.data);
+
         if (from_table.len == 0)
         {
             pfree(from_table.data);
+            pfree(where_clause.data);
             pfree(order_by.data);
             return NULL;
         }
@@ -394,6 +535,11 @@ extract_pushed_sql(const char *plan_text)
         initStringInfo(&sql);
         appendStringInfoString(&sql, "SELECT * FROM ");
         appendStringInfoString(&sql, from_table.data);
+        if (where_clause.len > 0)
+        {
+            appendStringInfoString(&sql, " WHERE ");
+            appendStringInfoString(&sql, where_clause.data);
+        }
         if (order_by.len > 0)
         {
             appendStringInfoString(&sql, " ORDER BY ");
@@ -401,6 +547,7 @@ extract_pushed_sql(const char *plan_text)
         }
 
         pfree(from_table.data);
+        pfree(where_clause.data);
         pfree(order_by.data);
 
         return sql.data;

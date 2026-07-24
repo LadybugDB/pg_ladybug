@@ -58,6 +58,19 @@ extern bool   ladybug_bridge_attach_postgres(LadybugBridge *b,
 extern void   ladybug_bridge_release(LadybugBridge *b);
 
 /* ------------------------------------------------------------------ */
+/* Sync PG catalog to Ladybug: ensure rel tables are visible as        */
+/* relationship tables.  Called after ensure_attached().               */
+/* The ATTACH creates all PG tables as NODE tables.  For rel_* tables  */
+/* we drop the auto-created node table and create a proper REL TABLE.  */
+/* ------------------------------------------------------------------ */
+static void
+sync_catalog(LadybugBridge *b)
+{
+    /* The ATTACH via postgres extension already registers all PG tables
+     * as node tables.  Relationship support will be added later. */
+}
+
+/* ------------------------------------------------------------------ */
 /* GUCs                                                               */
 /* ------------------------------------------------------------------ */
 static char *ladybug_lib_path  = "liblbug.so";
@@ -145,6 +158,7 @@ ensure_attached(LadybugBridge *b)
             /* ereport(ERROR) does not return */
         }
     }
+
 }
 
 /* ------------------------------------------------------------------ */
