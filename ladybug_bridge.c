@@ -28,6 +28,10 @@
 
 #include "utils/guc.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/tuplestore.h"
+#include "access/htup_details.h"
+#include "fmgr.h"
 
 /* ================================================================ */
 /*  Opaque handle types (mirror lbug.h — never include the header)  */
@@ -101,6 +105,7 @@ typedef bool               (*pf_query_result_has_next)(lbug_query_result *);
 typedef lbug_state         (*pf_query_result_get_next)(lbug_query_result *, lbug_flat_tuple *);
 typedef lbug_state         (*pf_flat_tuple_get_value)(lbug_flat_tuple *, uint64_t, lbug_value *);
 typedef lbug_state         (*pf_value_get_string)(lbug_value *, char **);
+typedef bool               (*pf_value_is_null)(lbug_value *);
 typedef char *             (*pf_value_to_string)(lbug_value *);
 typedef uint64_t           (*pf_query_result_get_num_columns)(lbug_query_result *);
 typedef uint64_t           (*pf_query_result_get_num_tuples)(lbug_query_result *);
@@ -134,6 +139,7 @@ typedef struct LadybugBridge
     pf_query_result_get_next          query_result_get_next;
     pf_flat_tuple_get_value           flat_tuple_get_value;
     pf_value_get_string               value_get_string;
+    pf_value_is_null                  value_is_null;
     pf_value_to_string                value_to_string;
     pf_query_result_get_num_columns   query_result_get_num_columns;
     pf_query_result_get_num_tuples    query_result_get_num_tuples;
@@ -223,23 +229,15 @@ clean_plan_line(const char *line)
 }
 
 /*
- * Extract the pushed-down SQL from an EXPLAIN plan text, porting the
- * notebook algorithm verbatim:
+ * Extract the pushed-down SQL from an EXPLAIN plan text.
  *
- *   capturing = False
- *   for line in plan.splitlines():
- *       if "Function:" in line:
- *           capturing = True
- *           line = line.split("Function:", 1)[1]
- *       elif capturing and ("Expressions:" in line or "NumOutputTuples:" in line):
- *           break
- *       if capturing:
- *           cleaned = line.replace("│","").strip()
- *           if cleaned: sql_parts.append(cleaned)
- *   pushed_down_sql = " ".join(sql_parts)
+ * Strategy:
+ * 1. Look for "Function:" section (from ForeignJoinPushDownOptimizer).
+ *    If found, capture text after it (the full SQL pushed down).
+ * 2. If no "Function:" section, construct a SELECT query from the
+ *    SCAN_NODE_TABLE (table name, properties) and ORDER_BY sections.
  *
- * Returns a palloc'd SQL string, or NULL if no "Function:" pushdown box
- * was found.
+ * Returns a palloc'd SQL string, or NULL on failure.
  */
 static char *
 extract_pushed_sql(const char *plan_text)
@@ -247,74 +245,166 @@ extract_pushed_sql(const char *plan_text)
     if (plan_text == NULL || plan_text[0] == '\0')
         return NULL;
 
-    StringInfoData result;
-    initStringInfo(&result);
-
-    bool capturing = false;
-    bool first_part = true;
-
-    const char *line_start = plan_text;
-    while (line_start && *line_start)
+    /* First pass: try to find a "Function:" section (foreign pushdown) */
     {
-        /* find end of line */
-        const char *line_end = strchr(line_start, '\n');
-        size_t      line_len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
+        StringInfoData result;
+        initStringInfo(&result);
 
-        /* make a NUL-terminated copy of the line */
-        char *line = pnstrdup(line_start, line_len);
+        bool capturing = false;
+        bool first_part = true;
+        bool found_function = false;
 
-        if (!capturing && strstr(line, "Function:") != NULL)
+        const char *line_start = plan_text;
+        while (line_start && *line_start)
         {
-            /* start capturing; take substring after "Function:" */
-            char *after = strstr(line, "Function:");
-            after += strlen("Function:");
-            char *cleaned = clean_plan_line(after);
-            if (cleaned[0] != '\0')
+            const char *line_end = strchr(line_start, '\n');
+            size_t line_len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
+            char *line = pnstrdup(line_start, line_len);
+
+            if (!capturing && strstr(line, "Function:") != NULL)
             {
-                if (!first_part)
-                    appendStringInfoChar(&result, ' ');
-                appendStringInfoString(&result, cleaned);
-                first_part = false;
+                found_function = true;
+                char *after = strstr(line, "Function:");
+                after += strlen("Function:");
+                char *cleaned = clean_plan_line(after);
+                if (cleaned[0] != '\0')
+                {
+                    if (!first_part)
+                        appendStringInfoChar(&result, ' ');
+                    appendStringInfoString(&result, cleaned);
+                    first_part = false;
+                }
+                pfree(cleaned);
+                capturing = true;
             }
-            pfree(cleaned);
-            capturing = true;
+            else if (capturing)
+            {
+                if (strstr(line, "Expressions:") != NULL ||
+                    strstr(line, "NumOutputTuples:") != NULL)
+                {
+                    pfree(line);
+                    break;
+                }
+                char *cleaned = clean_plan_line(line);
+                if (cleaned[0] != '\0')
+                {
+                    if (!first_part)
+                        appendStringInfoChar(&result, ' ');
+                    appendStringInfoString(&result, cleaned);
+                    first_part = false;
+                }
+                pfree(cleaned);
+            }
+
+            pfree(line);
+            line_start = line_end ? line_end + 1 : NULL;
         }
-        else if (capturing)
+
+        if (found_function && result.len > 0)
         {
-            if (strstr(line, "Expressions:") != NULL ||
-                strstr(line, "NumOutputTuples:") != NULL)
-            {
-                pfree(line);
-                break;
-            }
+            return result.data;
+        }
+        if (found_function)
+        {
+            pfree(result.data);
+            return NULL;
+        }
+        pfree(result.data);
+    }
+
+    /*
+     * Second pass: no "Function:" section found.  Construct a simple
+     * SELECT * FROM <table> [ORDER BY ...].  Column ordering is handled
+     * by name-based mapping in pg_ladybug.c.
+     */
+    {
+        StringInfoData from_table;
+        StringInfoData order_by;
+        initStringInfo(&from_table);
+        initStringInfo(&order_by);
+
+        bool order_first = true;
+        bool got_order_by = false;
+
+        const char *line_start = plan_text;
+        while (line_start && *line_start)
+        {
+            const char *line_end = strchr(line_start, '\n');
+            size_t line_len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
+            char *line = pnstrdup(line_start, line_len);
             char *cleaned = clean_plan_line(line);
+
             if (cleaned[0] != '\0')
             {
-                if (!first_part)
-                    appendStringInfoChar(&result, ' ');
-                appendStringInfoString(&result, cleaned);
-                first_part = false;
+                char *uc = cleaned;
+
+                /* Extract table name from "Tables: <name>" */
+                if (strstr(uc, "Tables:") != NULL)
+                {
+                    char *t = strstr(uc, "Tables:");
+                    t += strlen("Tables:");
+                    while (*t == ' ') t++;
+                    if (from_table.len == 0)
+                        appendStringInfoString(&from_table, t);
+                }
+
+                /* Extract ORDER BY from FIRST "Order By: <expr>" */
+                if (!got_order_by && strstr(uc, "Order By:") != NULL)
+                {
+                    got_order_by = true;
+                    char *o = strstr(uc, "Order By:");
+                    o += strlen("Order By:");
+                    while (*o == ' ') o++;
+                    char *ord = o;
+                    while (*ord)
+                    {
+                        while (*ord == ' ') ord++;
+                        if (*ord == '\0') break;
+                        char *end = ord;
+                        while (*end && *end != ',' && *end != '\n' && *end != '\r') end++;
+                        char saved = *end;
+                        *end = '\0';
+                        char *col = ord;
+                        char *dot = strchr(col, '.');
+                        if (dot) col = dot + 1;
+                        if (!order_first)
+                            appendStringInfoString(&order_by, ", ");
+                        appendStringInfoString(&order_by, col);
+                        order_first = false;
+                        *end = saved;
+                        ord = end;
+                        if (*ord == ',') ord++;
+                    }
+                }
             }
+
             pfree(cleaned);
+            pfree(line);
+            line_start = line_end ? line_end + 1 : NULL;
         }
 
-        pfree(line);
-        line_start = line_end ? line_end + 1 : NULL;
-    }
+        if (from_table.len == 0)
+        {
+            pfree(from_table.data);
+            pfree(order_by.data);
+            return NULL;
+        }
 
-    if (!capturing)
-    {
-        pfree(result.data);
-        return NULL;
-    }
+        StringInfoData sql;
+        initStringInfo(&sql);
+        appendStringInfoString(&sql, "SELECT * FROM ");
+        appendStringInfoString(&sql, from_table.data);
+        if (order_by.len > 0)
+        {
+            appendStringInfoString(&sql, " ORDER BY ");
+            appendStringInfoString(&sql, order_by.data);
+        }
 
-    if (result.len == 0)
-    {
-        pfree(result.data);
-        return NULL;
-    }
+        pfree(from_table.data);
+        pfree(order_by.data);
 
-    return result.data;
+        return sql.data;
+    }
 }
 
 /* ================================================================ */
@@ -377,6 +467,7 @@ ladybug_bridge_acquire(const char **err_msg)
     RESOLVE(query_result_get_next,         pf_query_result_get_next,           "lbug_query_result_get_next");
     RESOLVE(flat_tuple_get_value,          pf_flat_tuple_get_value,             "lbug_flat_tuple_get_value");
     RESOLVE(value_get_string,              pf_value_get_string,                 "lbug_value_get_string");
+    RESOLVE(value_is_null,                 pf_value_is_null,                    "lbug_value_is_null");
     RESOLVE(value_to_string,               pf_value_to_string,                  "lbug_value_to_string");
     RESOLVE(query_result_get_num_columns,  pf_query_result_get_num_columns,     "lbug_query_result_get_num_columns");
     RESOLVE(query_result_get_num_tuples,   pf_query_result_get_num_tuples,     "lbug_query_result_get_num_tuples");
@@ -622,6 +713,156 @@ ladybug_bridge_explain(LadybugBridge *b, const char *cypher, const char **err_ms
  * Called only if you want to teardown the static bridge (normally we keep
  * it alive for the life of the backend).
  */
+/*
+ * ladybug_bridge_execute_query - run a Cypher/SQL query and return
+ * the result as a string (like ladybug_bridge_direct_sql but
+ * returns the raw result without the "explain result" prefix).
+ *
+ * On failure returns NULL and sets *err_msg.
+ */
+char *
+ladybug_bridge_execute_query(LadybugBridge *b, const char *query, const char **err_msg)
+{
+    if (b == NULL)
+    {
+        if (err_msg) *err_msg = pstrdup("ladybug: bridge not initialized");
+        return NULL;
+    }
+
+    return ladybug_bridge_direct_sql(b, query, err_msg);
+}
+
+/*
+ * ladybug_bridge_fill_tuplestore_from_query - run a query through the
+ * Ladybug connection and fill a tuplestore with the results.
+ * Returns the number of rows filled, or -1 on error.
+ *
+ * Each row value is converted to a PG Datum via InputFunctionCall.
+ */
+int
+ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
+    const char *query,
+    Tuplestorestate *ts,
+    TupleDesc tupdesc,
+    const char **err_msg)
+{
+    if (b == NULL || !b->inited)
+    {
+        if (err_msg) *err_msg = pstrdup("ladybug: bridge not initialized");
+        return -1;
+    }
+
+    lbug_query_result result;
+    memset(&result, 0, sizeof(result));
+
+    lbug_state st = b->connection_query(&b->connection, query, &result);
+    if (st != 0 || !b->query_result_is_success(&result))
+    {
+        char *lbug_err = NULL;
+        if (b->query_result_get_error_message)
+            lbug_err = b->query_result_get_error_message(&result);
+        if (err_msg)
+            *err_msg = psprintf("ladybug: query failed: %s",
+                                lbug_err ? lbug_err : "(no error message)");
+        if (lbug_err)
+            b->destroy_string(lbug_err);
+        b->query_result_destroy(&result);
+        return -1;
+    }
+
+    /* Get number of columns */
+    int num_cols = (int)b->query_result_get_num_columns(&result);
+    int natts = tupdesc->natts;
+
+    if (num_cols != natts)
+    {
+        if (err_msg)
+            *err_msg = psprintf("ladybug: column count mismatch: query returns %d columns, expected %d",
+                                num_cols, natts);
+        b->query_result_destroy(&result);
+        return -1;
+    }
+
+    /* Iterate through result tuples */
+    int nrows = 0;
+    while (b->query_result_has_next(&result))
+    {
+        lbug_flat_tuple flat_tuple;
+        memset(&flat_tuple, 0, sizeof(flat_tuple));
+
+        st = b->query_result_get_next(&result, &flat_tuple);
+        if (st != 0)
+        {
+            if (err_msg)
+                *err_msg = pstrdup("ladybug: error fetching next tuple");
+            b->query_result_destroy(&result);
+            return -1;
+        }
+
+        Datum *values = (Datum *) palloc0(natts * sizeof(Datum));
+        bool  *nulls  = (bool  *) palloc0(natts * sizeof(bool));
+
+        for (int a = 0; a < natts; a++)
+        {
+            lbug_value val;
+            memset(&val, 0, sizeof(val));
+
+            st = b->flat_tuple_get_value(&flat_tuple, (uint64_t)a, &val);
+            if (st != 0 || b->value_is_null(&val))
+            {
+                nulls[a] = true;
+                values[a] = (Datum) 0;
+                continue;
+            }
+
+            /* Get the value as a string */
+            char *str = NULL;
+            st = b->value_get_string(&val, &str);
+            if (st != 0 || str == NULL)
+            {
+                /* Fall back to to_string */
+                str = b->value_to_string(&val);
+            }
+
+            if (str != NULL)
+            {
+                /* Convert string to PG datum using the expected type's input function */
+                Oid typid = TupleDescAttr(tupdesc, a)->atttypid;
+                int32 typmod = TupleDescAttr(tupdesc, a)->atttypmod;
+                Oid typioparam;
+                Oid typinput;
+
+                getTypeInputInfo(typid, &typinput, &typioparam);
+                FmgrInfo finfo;
+                fmgr_info(typinput, &finfo);
+
+                values[a] = InputFunctionCall(&finfo, str, typioparam, typmod);
+                nulls[a] = false;
+
+                b->destroy_string(str);
+            }
+            else
+            {
+                nulls[a] = true;
+                values[a] = (Datum) 0;
+            }
+        }
+
+        /* Build and store the tuple */
+        HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+        tuplestore_puttuple(ts, tuple);
+        heap_freetuple(tuple);
+
+        pfree(values);
+        pfree(nulls);
+
+        nrows++;
+    }
+
+    b->query_result_destroy(&result);
+    return nrows;
+}
+
 void
 ladybug_bridge_release(LadybugBridge *b)
 {

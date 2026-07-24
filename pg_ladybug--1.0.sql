@@ -6,9 +6,6 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_ladybug" to load this file. \quit
 
--- Create the ladybug schema for catalog tables and helper functions
-CREATE SCHEMA IF NOT EXISTS ladybug;
-
 -- Graph metadata catalog: maps node/edge labels to tables
 CREATE TABLE IF NOT EXISTS ladybug._graph_meta (
     id          SERIAL PRIMARY KEY,

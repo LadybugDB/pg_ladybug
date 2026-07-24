@@ -66,25 +66,26 @@ static char *ladybug_pg_connstr = "";
 /* ------------------------------------------------------------------ */
 /* SRF execution context for row streaming                             */
 /* ------------------------------------------------------------------ */
+#define MAX_COLS 64
 typedef struct LadybugSRFContext
 {
-    Tuplestorestate *tuplestore;
-    TupleDesc        tupdesc;
-    int              natts;
+    TupleDesc       tupdesc;
+    int             natts;
+    int             current_row;  /* current row index while iterating */
+    int             nrows;        /* total rows */
+    Datum          *values[MAX_COLS]; /* per-row Datum arrays */
+    bool           *nulls[MAX_COLS];  /* per-row null flags */
 } LadybugSRFContext;
 
 /* ------------------------------------------------------------------ */
-/* Core: run SQL via SPI and copy rows into a tuplestore               */
+/* Core: run SQL via SPI and return the SPITupleTable for direct use    */
+/* Returns the number of rows, or -1 on error.                          */
 /* ------------------------------------------------------------------ */
-static Tuplestorestate *
-spi_select_into_tuplestore(const char *sql, TupleDesc expected_tupdesc,
-                           int *out_nrows)
+static int
+spi_execute_and_capture(const char *sql, TupleDesc expected_tupdesc,
+                        SPITupleTable **out_tuptable, int *out_ncols)
 {
     int ret;
-    SPITupleTable *tuptable;
-    Tuplestorestate *ts;
-    int nrows;
-    int natts;
 
     ret = SPI_connect();
     if (ret != SPI_OK_CONNECT)
@@ -104,65 +105,11 @@ spi_select_into_tuplestore(const char *sql, TupleDesc expected_tupdesc,
                  errhint("The pushed-down SQL: %s", sql)));
     }
 
-    tuptable = SPI_tuptable;
-    nrows = (int) SPI_processed;
-    natts = tuptable->tupdesc->natts;
+    *out_tuptable = SPI_tuptable;
+    if (out_ncols)
+        *out_ncols = SPI_tuptable ? SPI_tuptable->tupdesc->natts : 0;
 
-    /*
-     * Build the tuplestore in the multi-call memory context so it survives
-     * across SRF per-call iterations.  We copy each SPI row out of the SPI
-     * memory context into heap-form tuples and put them in the store.
-     */
-    ts = tuplestore_begin_heap(false /* randomAccess */,
-                               false /* interXact */,
-                               1024 /* work_mem_bytes */);
-
-    for (int i = 0; i < nrows; i++)
-    {
-        HeapTuple spi_tup = tuptable->vals[i];
-        TupleDesc spi_tupdesc = tuptable->tupdesc;
-        Datum    *values;
-        bool     *nulls;
-
-        HeapTuple result;
-        values = (Datum *) palloc0(natts * sizeof(Datum));
-        nulls  = (bool  *) palloc0(natts * sizeof(bool));
-
-        for (int a = 0; a < natts; a++)
-        {
-            bool isnull = false;
-            values[a] = SPI_getbinval(spi_tup, spi_tupdesc, a + 1, &isnull);
-            nulls[a] = isnull;
-        }
-
-        /*
-         * If the SPI tuple descriptor matches the expected (caller-provided)
-         * tuple descriptor column-for-column by type, use the expected
-         * tupdesc for the stored tuple; otherwise use the SPI tupdesc.
-         * In practice the pushed-down SQL projection should match the
-         * caller's AS t(...) declaration.
-         */
-        if (expected_tupdesc &&
-            expected_tupdesc->natts == natts)
-        {
-            result = heap_form_tuple(expected_tupdesc, values, nulls);
-        }
-        else
-        {
-            result = heap_form_tuple(spi_tupdesc, values, nulls);
-        }
-        tuplestore_puttuple(ts, result);
-        heap_freetuple(result);
-
-        pfree(values);
-        pfree(nulls);
-    }
-
-    SPI_finish();
-
-    if (out_nrows)
-        *out_nrows = nrows;
-    return ts;
+    return (int) SPI_processed;
 }
 
 /* ------------------------------------------------------------------ */
@@ -211,8 +158,6 @@ ladybug_cypher(PG_FUNCTION_ARGS)
     FuncCallContext    *funcctx;
     LadybugSRFContext  *srfctx;
     TupleDesc           expected_tupdesc;
-    Tuplestorestate    *ts;
-    TupleTableSlot     *slot;
 
     if (SRF_IS_FIRSTCALL())
     {
@@ -223,6 +168,8 @@ ladybug_cypher(PG_FUNCTION_ARGS)
         char    *sql;
         LadybugBridge *b;
         int nrows = 0;
+        int ncols = 0;
+        SPITupleTable *tuptable;
 
         funcctx = SRF_FIRSTCALL_INIT();
         oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
@@ -238,7 +185,8 @@ ladybug_cypher(PG_FUNCTION_ARGS)
         srfctx = (LadybugSRFContext *) palloc0(sizeof(LadybugSRFContext));
         srfctx->tupdesc = expected_tupdesc;
         srfctx->natts = expected_tupdesc->natts;
-        funcctx->max_calls = 0;   /* we use tuplestore, not max_calls */
+        srfctx->current_row = 0;
+        srfctx->nrows = 0;
         funcctx->user_fctx = srfctx;
 
         /* Acquire the Ladybug bridge */
@@ -276,35 +224,80 @@ ladybug_cypher(PG_FUNCTION_ARGS)
                         (errmsg("ladybug: could not extract pushed-down SQL")));
         }
 
-        elog(DEBUG1, "ladybug: pushed-down SQL: %s", sql);
-
-        /* Execute the SQL natively via SPI and fill a tuplestore */
-        ts = spi_select_into_tuplestore(sql, expected_tupdesc, &nrows);
+        /* Execute SQL via SPI and copy all row data into multi-call memory context */
+        nrows = spi_execute_and_capture(sql, expected_tupdesc, &tuptable, &ncols);
         pfree(sql);
 
-        srfctx->tuplestore = ts;
+        srfctx->nrows = nrows;
         funcctx->max_calls = nrows;
+        /*
+         * Build HeapTuples BEFORE SPI_finish, because SPI_getbinval may
+         * return pointers into SPI memory that would be freed by SPI_finish.
+         * Store the Datum representation of each HeapTuple in multi-call ctx.
+         */
+        if (nrows > 0 && tuptable != NULL)
+        {
+            TupleDesc spi_tupdesc = tuptable->tupdesc;
+            /* Build column name mapping from SPI result columns to expected */
+            int *col_map = (int *) palloc(ncols * sizeof(int));
+            for (int a = 0; a < ncols; a++)
+            {
+                col_map[a] = -1;
+                const char *exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
+                for (int b = 0; b < ncols; b++)
+                {
+                    const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
+                    if (strcmp(exp_name, spi_name) == 0)
+                    {
+                        col_map[a] = b;
+                        break;
+                    }
+                }
+                if (col_map[a] < 0)
+                    col_map[a] = a; /* fallback to positional */
+            }
 
+            for (int i = 0; i < nrows && i < MAX_COLS; i++)
+            {
+                HeapTuple spi_tup = tuptable->vals[i];
+                Datum *vals = (Datum *) palloc(ncols * sizeof(Datum));
+                bool  *nls  = (bool  *) palloc(ncols * sizeof(bool));
+
+                for (int a = 0; a < ncols; a++)
+                {
+                    int spi_idx = col_map[a];
+                    bool isnull = false;
+                    vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                    nls[a] = isnull;
+                }
+
+                /* Build the heap tuple now, while SPI data is still valid */
+                HeapTuple ht = heap_form_tuple(expected_tupdesc, vals, nls);
+                srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
+                srfctx->values[i][0] = HeapTupleGetDatum(ht);
+                srfctx->nulls[i] = NULL;
+
+                pfree(vals);
+                pfree(nls);
+            }
+            pfree(col_map);
+        }
+
+        SPI_finish();
         MemoryContextSwitchTo(oldcontext);
     }
 
     funcctx = SRF_PERCALL_SETUP();
     srfctx = (LadybugSRFContext *) funcctx->user_fctx;
-    ts = srfctx->tuplestore;
 
-    /*
-     * Use a slot compatible with the expected tupdesc to drain the store.
-     */
-    slot = MakeSingleTupleTableSlot(srfctx->tupdesc, &TTSOpsHeapTuple);
-    if (tuplestore_gettupleslot(ts, true /* forward */, false, slot))
+    if (srfctx->current_row < srfctx->nrows && srfctx->current_row < MAX_COLS)
     {
-        Datum result = ExecFetchSlotHeapTupleDatum(slot);
-        ExecClearTuple(slot);
-        ExecDropSingleTupleTableSlot(slot);
+        int i = srfctx->current_row;
+        Datum result = srfctx->values[i][0];
+        srfctx->current_row++;
         SRF_RETURN_NEXT(funcctx, result);
     }
 
-    ExecDropSingleTupleTableSlot(slot);
     SRF_RETURN_DONE(funcctx);
 }
 
@@ -320,8 +313,6 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
     FuncCallContext    *funcctx;
     LadybugSRFContext  *srfctx;
     TupleDesc           expected_tupdesc;
-    Tuplestorestate    *ts;
-    TupleTableSlot     *slot;
     text    *query_text;
     char    *query_cstr;
 
@@ -329,6 +320,8 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
     {
         MemoryContext oldcontext;
         int nrows = 0;
+        int ncols = 0;
+        SPITupleTable *tuptable;
 
         funcctx = SRF_FIRSTCALL_INIT();
         oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
@@ -343,35 +336,87 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
         srfctx = (LadybugSRFContext *) palloc0(sizeof(LadybugSRFContext));
         srfctx->tupdesc = expected_tupdesc;
         srfctx->natts = expected_tupdesc->natts;
+        srfctx->current_row = 0;
+        srfctx->nrows = 0;
         funcctx->user_fctx = srfctx;
         funcctx->max_calls = 0;
 
         query_text = PG_GETARG_TEXT_PP(0);
         query_cstr = text_to_cstring(query_text);
 
-        ts = spi_select_into_tuplestore(query_cstr, expected_tupdesc, &nrows);
+        nrows = spi_execute_and_capture(query_cstr, expected_tupdesc, &tuptable, &ncols);
         pfree(query_cstr);
 
-        srfctx->tuplestore = ts;
+        srfctx->nrows = nrows;
         funcctx->max_calls = nrows;
 
+        /*
+         * Build HeapTuples BEFORE SPI_finish, because SPI_getbinval may
+         * return pointers into SPI memory that would be freed by SPI_finish.
+         */
+        if (nrows > 0 && tuptable != NULL)
+        {
+            TupleDesc spi_tupdesc = tuptable->tupdesc;
+            /* Build column name mapping from SPI result columns to expected */
+            int *col_map = (int *) palloc(ncols * sizeof(int));
+            for (int a = 0; a < ncols; a++)
+            {
+                col_map[a] = -1;
+                const char *exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
+                for (int b = 0; b < ncols; b++)
+                {
+                    const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
+                    if (strcmp(exp_name, spi_name) == 0)
+                    {
+                        col_map[a] = b;
+                        break;
+                    }
+                }
+                if (col_map[a] < 0)
+                    col_map[a] = a;
+            }
+
+            for (int i = 0; i < nrows && i < MAX_COLS; i++)
+            {
+                HeapTuple spi_tup = tuptable->vals[i];
+                Datum *vals = (Datum *) palloc(ncols * sizeof(Datum));
+                bool  *nls  = (bool  *) palloc(ncols * sizeof(bool));
+
+                for (int a = 0; a < ncols; a++)
+                {
+                    int spi_idx = col_map[a];
+                    bool isnull = false;
+                    vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                    nls[a] = isnull;
+                }
+
+                /* Build the heap tuple now, while SPI data is still valid */
+                HeapTuple ht = heap_form_tuple(expected_tupdesc, vals, nls);
+                srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
+                srfctx->values[i][0] = HeapTupleGetDatum(ht);
+                srfctx->nulls[i] = NULL;
+
+                pfree(vals);
+                pfree(nls);
+            }
+            pfree(col_map);
+        }
+
+        SPI_finish();
         MemoryContextSwitchTo(oldcontext);
     }
 
     funcctx = SRF_PERCALL_SETUP();
     srfctx = (LadybugSRFContext *) funcctx->user_fctx;
-    ts = srfctx->tuplestore;
 
-    slot = MakeSingleTupleTableSlot(srfctx->tupdesc, &TTSOpsHeapTuple);
-    if (tuplestore_gettupleslot(ts, true, false, slot))
+    if (srfctx->current_row < srfctx->nrows && srfctx->current_row < MAX_COLS)
     {
-        Datum result = ExecFetchSlotHeapTupleDatum(slot);
-        ExecClearTuple(slot);
-        ExecDropSingleTupleTableSlot(slot);
+        int i = srfctx->current_row;
+        Datum result = srfctx->values[i][0];
+        srfctx->current_row++;
         SRF_RETURN_NEXT(funcctx, result);
     }
 
-    ExecDropSingleTupleTableSlot(slot);
     SRF_RETURN_DONE(funcctx);
 }
 
@@ -401,6 +446,9 @@ ladybug_explain(PG_FUNCTION_ARGS)
             ereport(ERROR,
                     (errmsg("ladybug: cannot load Ladybug engine")));
     }
+
+    /* Ensure ATTACH has happened so the planner can resolve tables */
+    ensure_attached(b);
 
     cypher_cstr = text_to_cstring(cypher_text);
     plan_text = ladybug_bridge_explain(b, cypher_cstr, &err_msg);
