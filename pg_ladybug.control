@@ -1,0 +1,6 @@
+# pg_ladybug extension
+comment = 'Cypher query support through the embedded Ladybug graph engine'
+default_version = '1.0'
+module_pathname = '$libdir/pg_ladybug'
+relocatable = true
+schema = ladybug
