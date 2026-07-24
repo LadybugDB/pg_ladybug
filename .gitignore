@@ -8,3 +8,4 @@ pg_ladybug.so
 lib/
 .lbug/
 test_results/
+._*\n.github/._*
