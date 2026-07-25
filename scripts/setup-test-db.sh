@@ -70,32 +70,31 @@ CREATE TABLE IF NOT EXISTS rel_lives_in (
 );
 
 -- Sample data
+-- Clear existing data and re-insert
+TRUNCATE TABLE rel_lives_in, rel_knows, node_city, node_person RESTART IDENTITY CASCADE;
+
 INSERT INTO node_person (name, age) VALUES
     ('Alice', 30),
     ('Bob', 25),
     ('Carol', 35),
-    ('Dave', 28)
-ON CONFLICT DO NOTHING;
+    ('Dave', 28);
 
 INSERT INTO node_city (name, population) VALUES
     ('New York', 8336000),
     ('San Francisco', 874961),
-    ('London', 8982000)
-ON CONFLICT DO NOTHING;
+    ('London', 8982000);
 
 INSERT INTO rel_knows (src_id, dst_id, since) VALUES
     (1, 2, 2020),
     (1, 3, 2019),
     (2, 3, 2021),
-    (3, 4, 2022)
-ON CONFLICT DO NOTHING;
+    (3, 4, 2022);
 
 INSERT INTO rel_lives_in (src_id, dst_id) VALUES
     (1, 1),
     (2, 2),
     (3, 3),
-    (4, 2)
-ON CONFLICT DO NOTHING;
+    (4, 2);
 EOSQL
 
 # Register labels in _graph_meta

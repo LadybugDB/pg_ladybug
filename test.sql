@@ -122,6 +122,8 @@ WHERE kind = 'edge';
 -- In-place query tests (requires liblbug + ATTACH)
 -- These test the bridge flow: Cypher -> plan -> SQL -> SPI
 -- ============================================================
+-- Drop temp tables from prior tests so they don't interfere
+DROP TABLE IF EXISTS persons, knows;
 SELECT '=== in-place query tests (conditional on liblbug) ===' AS info;
 
 /*
