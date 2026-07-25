@@ -58,19 +58,6 @@ extern bool   ladybug_bridge_attach_postgres(LadybugBridge *b,
 extern void   ladybug_bridge_release(LadybugBridge *b);
 
 /* ------------------------------------------------------------------ */
-/* Sync PG catalog to Ladybug: ensure rel tables are visible as        */
-/* relationship tables.  Called after ensure_attached().               */
-/* The ATTACH creates all PG tables as NODE tables.  For rel_* tables  */
-/* we drop the auto-created node table and create a proper REL TABLE.  */
-/* ------------------------------------------------------------------ */
-static void
-sync_catalog(LadybugBridge *b)
-{
-    /* The ATTACH via postgres extension already registers all PG tables
-     * as node tables.  Relationship support will be added later. */
-}
-
-/* ------------------------------------------------------------------ */
 /* GUCs                                                               */
 /* ------------------------------------------------------------------ */
 static char *ladybug_lib_path  = "liblbug.so";
@@ -256,8 +243,10 @@ ladybug_cypher(PG_FUNCTION_ARGS)
             int *col_map = (int *) palloc(ncols * sizeof(int));
             for (int a = 0; a < ncols; a++)
             {
+                const char *exp_name;
+
                 col_map[a] = -1;
-                const char *exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
+                exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
                 for (int b = 0; b < ncols; b++)
                 {
                     const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
@@ -273,20 +262,28 @@ ladybug_cypher(PG_FUNCTION_ARGS)
 
             for (int i = 0; i < nrows && i < MAX_COLS; i++)
             {
-                HeapTuple spi_tup = tuptable->vals[i];
-                Datum *vals = (Datum *) palloc(ncols * sizeof(Datum));
-                bool  *nls  = (bool  *) palloc(ncols * sizeof(bool));
+                HeapTuple spi_tup;
+                Datum *vals;
+                bool  *nls;
+                HeapTuple ht;
+
+                spi_tup = tuptable->vals[i];
+                vals = (Datum *) palloc(ncols * sizeof(Datum));
+                nls  = (bool  *) palloc(ncols * sizeof(bool));
 
                 for (int a = 0; a < ncols; a++)
                 {
-                    int spi_idx = col_map[a];
-                    bool isnull = false;
+                    int spi_idx;
+                    bool isnull;
+
+                    spi_idx = col_map[a];
+                    isnull = false;
                     vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
                     nls[a] = isnull;
                 }
 
                 /* Build the heap tuple now, while SPI data is still valid */
-                HeapTuple ht = heap_form_tuple(expected_tupdesc, vals, nls);
+                ht = heap_form_tuple(expected_tupdesc, vals, nls);
                 srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
                 srfctx->values[i][0] = HeapTupleGetDatum(ht);
                 srfctx->nulls[i] = NULL;
@@ -375,8 +372,10 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
             int *col_map = (int *) palloc(ncols * sizeof(int));
             for (int a = 0; a < ncols; a++)
             {
+                const char *exp_name;
+
                 col_map[a] = -1;
-                const char *exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
+                exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
                 for (int b = 0; b < ncols; b++)
                 {
                     const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
@@ -392,20 +391,28 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
 
             for (int i = 0; i < nrows && i < MAX_COLS; i++)
             {
-                HeapTuple spi_tup = tuptable->vals[i];
-                Datum *vals = (Datum *) palloc(ncols * sizeof(Datum));
-                bool  *nls  = (bool  *) palloc(ncols * sizeof(bool));
+                HeapTuple spi_tup;
+                Datum *vals;
+                bool  *nls;
+                HeapTuple ht;
+
+                spi_tup = tuptable->vals[i];
+                vals = (Datum *) palloc(ncols * sizeof(Datum));
+                nls  = (bool  *) palloc(ncols * sizeof(bool));
 
                 for (int a = 0; a < ncols; a++)
                 {
-                    int spi_idx = col_map[a];
-                    bool isnull = false;
+                    int spi_idx;
+                    bool isnull;
+
+                    spi_idx = col_map[a];
+                    isnull = false;
                     vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
                     nls[a] = isnull;
                 }
 
                 /* Build the heap tuple now, while SPI data is still valid */
-                HeapTuple ht = heap_form_tuple(expected_tupdesc, vals, nls);
+                ht = heap_form_tuple(expected_tupdesc, vals, nls);
                 srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
                 srfctx->values[i][0] = HeapTupleGetDatum(ht);
                 srfctx->nulls[i] = NULL;

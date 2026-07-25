@@ -159,6 +159,19 @@ static LadybugBridge bridge = {0};
  */
 
 /* ================================================================ */
+/*  Forward declarations of public API                               */
+/* ================================================================ */
+
+LadybugBridge *ladybug_bridge_acquire(const char **err_msg);
+char  *ladybug_bridge_direct_sql(LadybugBridge *b, const char *sql, const char **err_msg);
+bool   ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const char **err_msg);
+char  *ladybug_bridge_pushed_sql(LadybugBridge *b, const char *cypher, const char **err_msg);
+char  *ladybug_bridge_explain(LadybugBridge *b, const char *cypher, const char **err_msg);
+char  *ladybug_bridge_execute_query(LadybugBridge *b, const char *query, const char **err_msg);
+int    ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b, const char *query, Tuplestorestate *ts, TupleDesc tupdesc, const char **err_msg);
+void   ladybug_bridge_release(LadybugBridge *b);
+
+/* ================================================================ */
 /*  Internal helpers                                                 */
 /* ================================================================ */
 
@@ -168,9 +181,12 @@ static LadybugBridge bridge = {0};
 static bool
 resolve_sym(void *handle, const char *name, void **out, const char **err_msg)
 {
+    void *sym;
+    const char *dl_err;
+
     dlerror();                                  /* clear stale error */
-    void *sym = dlsym(handle, name);
-    const char *dl_err = dlerror();
+    sym = dlsym(handle, name);
+    dl_err = dlerror();
     if (dl_err != NULL || sym == NULL)
     {
         if (err_msg)
@@ -196,11 +212,14 @@ clean_plan_line(const char *line)
      * / trailing ASCII whitespace.  The result is a compact copy.
      */
     StringInfoData buf;
-    initStringInfo(&buf);
+    const unsigned char *p;
+    bool started;
+    int last_non_space_end;
 
-    const unsigned char *p = (const unsigned char *) line;
-    bool started = false;
-    int last_non_space_end = 0;             /* tracked for right-trim */
+    initStringInfo(&buf);
+    p = (const unsigned char *) line;
+    started = false;
+    last_non_space_end = 0;             /* tracked for right-trim */
 
     while (*p)
     {
@@ -248,13 +267,16 @@ extract_pushed_sql(const char *plan_text)
     /* First pass: try to find a "Function:" section (foreign pushdown) */
     {
         StringInfoData result;
+        bool capturing;
+        bool first_part;
+        bool found_function;
+        const char *line_start;
+
         initStringInfo(&result);
-
-        bool capturing = false;
-        bool first_part = true;
-        bool found_function = false;
-
-        const char *line_start = plan_text;
+        capturing = false;
+        first_part = true;
+        found_function = false;
+        line_start = plan_text;
         while (line_start && *line_start)
         {
             const char *line_end = strchr(line_start, '\n');
@@ -263,10 +285,13 @@ extract_pushed_sql(const char *plan_text)
 
             if (!capturing && strstr(line, "Function:") != NULL)
             {
+                char *after;
+                char *cleaned;
+
                 found_function = true;
-                char *after = strstr(line, "Function:");
+                after = strstr(line, "Function:");
                 after += strlen("Function:");
-                char *cleaned = clean_plan_line(after);
+                cleaned = clean_plan_line(after);
                 if (cleaned[0] != '\0')
                 {
                     if (!first_part)
@@ -279,13 +304,15 @@ extract_pushed_sql(const char *plan_text)
             }
             else if (capturing)
             {
+                char *cleaned;
+
                 if (strstr(line, "Expressions:") != NULL ||
                     strstr(line, "NumOutputTuples:") != NULL)
                 {
                     pfree(line);
                     break;
                 }
-                char *cleaned = clean_plan_line(line);
+                cleaned = clean_plan_line(line);
                 if (cleaned[0] != '\0')
                 {
                     if (!first_part)
@@ -321,17 +348,20 @@ extract_pushed_sql(const char *plan_text)
         StringInfoData from_table;
         StringInfoData where_clause;
         StringInfoData order_by;
+        bool order_first;
+        bool got_order_by;
+        bool in_filter;
+        StringInfoData filter_text;
+        const char *line_start;
+
         initStringInfo(&from_table);
         initStringInfo(&where_clause);
         initStringInfo(&order_by);
-
-        bool order_first = true;
-        bool got_order_by = false;
-        bool in_filter = false;
-        StringInfoData filter_text;
+        order_first = true;
+        got_order_by = false;
+        in_filter = false;
         initStringInfo(&filter_text);
-
-        const char *line_start = plan_text;
+        line_start = plan_text;
         while (line_start && *line_start)
         {
             const char *line_end = strchr(line_start, '\n');
@@ -386,21 +416,29 @@ extract_pushed_sql(const char *plan_text)
                 /* Extract ORDER BY from FIRST "Order By: <expr>" */
                 if (!got_order_by && strstr(uc, "Order By:") != NULL)
                 {
+                    char *o;
+                    char *ord;
+                    char *end;
+                    char saved;
+
                     got_order_by = true;
-                    char *o = strstr(uc, "Order By:");
+                    o = strstr(uc, "Order By:");
                     o += strlen("Order By:");
                     while (*o == ' ') o++;
-                    char *ord = o;
+                    ord = o;
                     while (*ord)
                     {
+                        char *col;
+                        char *dot;
+
                         while (*ord == ' ') ord++;
                         if (*ord == '\0') break;
-                        char *end = ord;
+                        end = ord;
                         while (*end && *end != ',' && *end != '\n' && *end != '\r') end++;
-                        char saved = *end;
+                        saved = *end;
                         *end = '\0';
-                        char *col = ord;
-                        char *dot = strchr(col, '.');
+                        col = ord;
+                        dot = strchr(col, '.');
                         if (dot) col = dot + 1;
                         if (!order_first)
                             appendStringInfoString(&order_by, ", ");
@@ -460,8 +498,10 @@ extract_pushed_sql(const char *plan_text)
                         {
                             if (strncmp(src, "CAST(", 5) == 0)
                             {
+                                int d;
+
                                 src += 5;
-                                int d = 1;
+                                d = 1;
                                 while (*src && d > 0)
                                 {
                                     if (*src == '(') d++;
@@ -482,27 +522,36 @@ extract_pushed_sql(const char *plan_text)
 
                     /* Now clean contains something like "n.age 28" */
                     /* Split by spaces to get left and right operands */
-                    char *left_s = clean;
-                    while (*left_s == ' ') left_s++;
-                    char *mid_s = left_s;
-                    while (*mid_s && *mid_s != ' ') mid_s++;
-                    if (*mid_s == ' ')
                     {
-                        *mid_s = '\0';
-                        mid_s++;
-                        while (*mid_s == ' ') mid_s++;
-                        char *right_s = mid_s;
-                        /* Strip trailing parens or spaces */
-                        size_t rl = strlen(right_s);
-                        while (rl > 0 && (right_s[rl-1] == ')' || right_s[rl-1] == ' '))
-                            right_s[--rl] = '\0';
+                        char *left_s;
+                        char *mid_s;
+                        char *right_s;
+                        char *l;
+                        char *dot;
+                        size_t rl;
 
-                        /* Strip alias prefix */
-                        char *l = left_s;
-                        char *dot = strchr(l, '.');
-                        if (dot) l = dot + 1;
+                        left_s = clean;
+                        while (*left_s == ' ') left_s++;
+                        mid_s = left_s;
+                        while (*mid_s && *mid_s != ' ') mid_s++;
+                        if (*mid_s == ' ')
+                        {
+                            *mid_s = '\0';
+                            mid_s++;
+                            while (*mid_s == ' ') mid_s++;
+                            right_s = mid_s;
+                            /* Strip trailing parens or spaces */
+                            rl = strlen(right_s);
+                            while (rl > 0 && (right_s[rl-1] == ')' || right_s[rl-1] == ' '))
+                                right_s[--rl] = '\0';
 
-                        where_result = psprintf("%s %s %s", l, op, right_s);
+                            /* Strip alias prefix */
+                            l = left_s;
+                            dot = strchr(l, '.');
+                            if (dot) l = dot + 1;
+
+                            where_result = psprintf("%s %s %s", l, op, right_s);
+                        }
                     }
                     pfree(inner);
                     pfree(clean);
@@ -531,26 +580,28 @@ extract_pushed_sql(const char *plan_text)
             return NULL;
         }
 
-        StringInfoData sql;
-        initStringInfo(&sql);
-        appendStringInfoString(&sql, "SELECT * FROM ");
-        appendStringInfoString(&sql, from_table.data);
-        if (where_clause.len > 0)
         {
-            appendStringInfoString(&sql, " WHERE ");
-            appendStringInfoString(&sql, where_clause.data);
-        }
-        if (order_by.len > 0)
-        {
-            appendStringInfoString(&sql, " ORDER BY ");
-            appendStringInfoString(&sql, order_by.data);
-        }
+            StringInfoData sql;
+            initStringInfo(&sql);
+            appendStringInfoString(&sql, "SELECT * FROM ");
+            appendStringInfoString(&sql, from_table.data);
+            if (where_clause.len > 0)
+            {
+                appendStringInfoString(&sql, " WHERE ");
+                appendStringInfoString(&sql, where_clause.data);
+            }
+            if (order_by.len > 0)
+            {
+                appendStringInfoString(&sql, " ORDER BY ");
+                appendStringInfoString(&sql, order_by.data);
+            }
 
-        pfree(from_table.data);
-        pfree(where_clause.data);
-        pfree(order_by.data);
+            pfree(from_table.data);
+            pfree(where_clause.data);
+            pfree(order_by.data);
 
-        return sql.data;
+            return sql.data;
+        }
     }
 }
 
@@ -567,15 +618,21 @@ extract_pushed_sql(const char *plan_text)
 LadybugBridge *
 ladybug_bridge_acquire(const char **err_msg)
 {
+    const char *lib_path;
+    void *handle;
+    const char *e;
+    lbug_system_config cfg;
+    lbug_state st;
+
     if (bridge.inited)
         return &bridge;
 
-    const char *lib_path = GetConfigOptionByName("ladybug.lib_path", NULL, false);
+    lib_path = GetConfigOptionByName("ladybug.lib_path", NULL, false);
     if (lib_path == NULL || lib_path[0] == '\0')
         lib_path = "liblbug.so";
 
     dlerror();
-    void *handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
+    handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
     if (handle == NULL)
     {
         const char *dl_err = dlerror();
@@ -590,7 +647,7 @@ ladybug_bridge_acquire(const char **err_msg)
     bridge.dl_handle = handle;
 
     /* Resolve all symbols up front so failures are surfaced eagerly. */
-    const char *e = NULL;
+    e = NULL;
     #define RESOLVE(field, type, name) \
         do { \
             if (!resolve_sym(handle, name, (void **)&bridge.field, &e)) { \
@@ -625,8 +682,8 @@ ladybug_bridge_acquire(const char **err_msg)
     #undef RESOLVE
 
     /* Create in-memory Ladybug database + connection. */
-    lbug_system_config cfg = bridge.default_system_config();
-    lbug_state st = bridge.database_init(":memory:", cfg, &bridge.database);
+    cfg = bridge.default_system_config();
+    st = bridge.database_init(":memory:", cfg, &bridge.database);
     if (st != 0)
     {
         if (err_msg)
@@ -663,19 +720,24 @@ ladybug_bridge_acquire(const char **err_msg)
 char *
 ladybug_bridge_direct_sql(LadybugBridge *b, const char *sql, const char **err_msg)
 {
+    lbug_query_result result;
+    lbug_state st;
+    char *raw;
+    char *copy;
+    char *lbug_err;
+
     if (b == NULL)
     {
         if (err_msg) *err_msg = pstrdup("ladybug: bridge not initialized");
         return NULL;
     }
 
-    lbug_query_result result;
     memset(&result, 0, sizeof(result));
 
-    lbug_state st = b->connection_query(&b->connection, sql, &result);
+    st = b->connection_query(&b->connection, sql, &result);
     if (st != 0 || !b->query_result_is_success(&result))
     {
-        char *lbug_err = NULL;
+        lbug_err = NULL;
         if (b->query_result_get_error_message)
             lbug_err = b->query_result_get_error_message(&result);
         if (err_msg)
@@ -687,8 +749,8 @@ ladybug_bridge_direct_sql(LadybugBridge *b, const char *sql, const char **err_ms
         return NULL;
     }
 
-    char *raw = b->query_result_to_string(&result);
-    char *copy = NULL;
+    raw = b->query_result_to_string(&result);
+    copy = NULL;
     if (raw)
     {
         copy = pstrdup(raw);
@@ -709,6 +771,8 @@ ladybug_bridge_direct_sql(LadybugBridge *b, const char *sql, const char **err_ms
 bool
 ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const char **err_msg)
 {
+    const char *e;
+
     if (b == NULL)
     {
         if (err_msg) *err_msg = pstrdup("ladybug: bridge not initialized");
@@ -717,7 +781,7 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
     if (b->attached)
         return true;
 
-    const char *e = NULL;
+    e = NULL;
 
     /* INSTALL postgres; — may already be installed */
     if (!ladybug_bridge_direct_sql(b, "INSTALL postgres;", &e))
@@ -785,19 +849,23 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
 char *
 ladybug_bridge_pushed_sql(LadybugBridge *b, const char *cypher, const char **err_msg)
 {
+    StringInfoData explain_sql;
+    const char *e;
+    char *plan_text;
+    char *sql;
+
     if (b == NULL)
     {
         if (err_msg) *err_msg = pstrdup("ladybug: bridge not initialized");
         return NULL;
     }
 
-    StringInfoData explain_sql;
     initStringInfo(&explain_sql);
     appendStringInfoString(&explain_sql, "EXPLAIN ");
     appendStringInfoString(&explain_sql, cypher);
 
-    const char *e = NULL;
-    char *plan_text = ladybug_bridge_direct_sql(b, explain_sql.data, &e);
+    e = NULL;
+    plan_text = ladybug_bridge_direct_sql(b, explain_sql.data, &e);
     pfree(explain_sql.data);
 
     if (plan_text == NULL)
@@ -807,7 +875,7 @@ ladybug_bridge_pushed_sql(LadybugBridge *b, const char *cypher, const char **err
         return NULL;
     }
 
-    char *sql = extract_pushed_sql(plan_text);
+    sql = extract_pushed_sql(plan_text);
     pfree(plan_text);
 
     if (sql == NULL)
@@ -830,19 +898,22 @@ ladybug_bridge_pushed_sql(LadybugBridge *b, const char *cypher, const char **err
 char *
 ladybug_bridge_explain(LadybugBridge *b, const char *cypher, const char **err_msg)
 {
+    StringInfoData explain_sql;
+    const char *e;
+    char *plan_text;
+
     if (b == NULL)
     {
         if (err_msg) *err_msg = pstrdup("ladybug: bridge not initialized");
         return NULL;
     }
 
-    StringInfoData explain_sql;
     initStringInfo(&explain_sql);
     appendStringInfoString(&explain_sql, "EXPLAIN ");
     appendStringInfoString(&explain_sql, cypher);
 
-    const char *e = NULL;
-    char *plan_text = ladybug_bridge_direct_sql(b, explain_sql.data, &e);
+    e = NULL;
+    plan_text = ladybug_bridge_direct_sql(b, explain_sql.data, &e);
     pfree(explain_sql.data);
 
     if (plan_text == NULL)
@@ -893,19 +964,25 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
     TupleDesc tupdesc,
     const char **err_msg)
 {
+    lbug_query_result result;
+    lbug_state st;
+    char *lbug_err;
+    int num_cols;
+    int natts;
+    int nrows;
+
     if (b == NULL || !b->inited)
     {
         if (err_msg) *err_msg = pstrdup("ladybug: bridge not initialized");
         return -1;
     }
 
-    lbug_query_result result;
     memset(&result, 0, sizeof(result));
 
-    lbug_state st = b->connection_query(&b->connection, query, &result);
+    st = b->connection_query(&b->connection, query, &result);
     if (st != 0 || !b->query_result_is_success(&result))
     {
-        char *lbug_err = NULL;
+        lbug_err = NULL;
         if (b->query_result_get_error_message)
             lbug_err = b->query_result_get_error_message(&result);
         if (err_msg)
@@ -918,8 +995,8 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
     }
 
     /* Get number of columns */
-    int num_cols = (int)b->query_result_get_num_columns(&result);
-    int natts = tupdesc->natts;
+    num_cols = (int)b->query_result_get_num_columns(&result);
+    natts = tupdesc->natts;
 
     if (num_cols != natts)
     {
@@ -931,10 +1008,14 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
     }
 
     /* Iterate through result tuples */
-    int nrows = 0;
+    nrows = 0;
     while (b->query_result_has_next(&result))
     {
         lbug_flat_tuple flat_tuple;
+        Datum *values;
+        bool  *nulls;
+        HeapTuple tuple;
+
         memset(&flat_tuple, 0, sizeof(flat_tuple));
 
         st = b->query_result_get_next(&result, &flat_tuple);
@@ -946,12 +1027,14 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
             return -1;
         }
 
-        Datum *values = (Datum *) palloc0(natts * sizeof(Datum));
-        bool  *nulls  = (bool  *) palloc0(natts * sizeof(bool));
+        values = (Datum *) palloc0(natts * sizeof(Datum));
+        nulls  = (bool  *) palloc0(natts * sizeof(bool));
 
         for (int a = 0; a < natts; a++)
         {
             lbug_value val;
+            char *str;
+
             memset(&val, 0, sizeof(val));
 
             st = b->flat_tuple_get_value(&flat_tuple, (uint64_t)a, &val);
@@ -963,7 +1046,7 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
             }
 
             /* Get the value as a string */
-            char *str = NULL;
+            str = NULL;
             st = b->value_get_string(&val, &str);
             if (st != 0 || str == NULL)
             {
@@ -974,13 +1057,15 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
             if (str != NULL)
             {
                 /* Convert string to PG datum using the expected type's input function */
-                Oid typid = TupleDescAttr(tupdesc, a)->atttypid;
-                int32 typmod = TupleDescAttr(tupdesc, a)->atttypmod;
+                Oid typid;
+                int32 typmod;
                 Oid typioparam;
                 Oid typinput;
-
-                getTypeInputInfo(typid, &typinput, &typioparam);
                 FmgrInfo finfo;
+
+                typid = TupleDescAttr(tupdesc, a)->atttypid;
+                typmod = TupleDescAttr(tupdesc, a)->atttypmod;
+                getTypeInputInfo(typid, &typinput, &typioparam);
                 fmgr_info(typinput, &finfo);
 
                 values[a] = InputFunctionCall(&finfo, str, typioparam, typmod);
@@ -996,7 +1081,7 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
         }
 
         /* Build and store the tuple */
-        HeapTuple tuple = heap_form_tuple(tupdesc, values, nulls);
+        tuple = heap_form_tuple(tupdesc, values, nulls);
         tuplestore_puttuple(ts, tuple);
         heap_freetuple(tuple);
 
