@@ -148,4 +148,5 @@ RETURNS INTEGER
 LANGUAGE SQL
 AS $$
     DELETE FROM ladybug._graph_meta WHERE graph = reset_graph.graph;
+    SELECT 1::int;
 $$;

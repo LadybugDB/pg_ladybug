@@ -5,6 +5,10 @@
 
 CREATE EXTENSION IF NOT EXISTS pg_ladybug;
 
+-- Set GUCs for liblbug-dependent tests (no-op if liblbug unavailable)
+SET ladybug.lib_path = 'liblbug.so';
+SET ladybug.pg_connstr = 'host=/var/run/postgresql port=5433 dbname=ladybug_test user=postgres';
+
 -- List available functions
 \df ladybug.*
 

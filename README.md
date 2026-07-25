@@ -9,100 +9,122 @@ tables — with native Postgres execution under the hood.
 ## How it works
 
 1. You declare which Postgres tables represent Cypher node/edge labels
-   (`ladybug.register_node`, `ladybug.register_edge`).
-2. You write a Cypher `MATCH` query.
+   (`ladybug.register_node`, `ladybug.register_edge`), or use the `node_*`/`rel_*`
+   naming convention.
+2. You write a `MATCH` query in Cypher.
 3. `pg_ladybug` hands it to the embedded Ladybug planner via `dlopen("liblbug.so")`.
    Ladybug's `ForeignJoinPushDownOptimizer` detects that all tables are backed by
    the *same* Postgres database and rewrites the entire pattern into a **single SQL
    JOIN query**.
-4. `pg_ladybug` extracts that SQL from the EXPLAIN plan (the exact technique from
-   [Ladybug's DuckDB-attach notebook](https://github.com/LadybugDB/ladybug-icebug-notebook/blob/main/ladybug_duckdb_attached_starwars.ipynb))
-   and runs it **natively via SPI** against the local Postgres tables.
+4. `pg_ladybug` extracts that SQL from the EXPLAIN plan and runs it **natively via
+   SPI** against your local Postgres tables.
 5. Results stream back through a standard `SETOF record` SRF.
 
 No second query engine runs in your Postgres backend. The only "foreign" engine is
-`liblbug`, loaded *out-of-band* and used purely as a Cypher→SQL compiler.
-DuckDB never loads in your Postgres server.
+`liblbug`, loaded *out-of-band* and used purely as a Cypher → SQL compiler.
 
 ## Requirements
 
-- **PostgreSQL 17** (other versions may work; tested on 17)
+- **PostgreSQL 18** (other versions may work; tested on 18)
 - **pg_config** (postgresql-server-dev package)
 - **`liblbug.so`** at runtime (the Ladybug engine shared library; see Installation)
 - **OpenSSL** (liblbug requires `libssl`/`libcrypto`)
 
-## Installation
-
-### Building the extension
-
-```bash
-make
-sudo make install
-```
-
-### Getting liblbug
-
-You need the Ladybug shared library available on your system. Download a prebuilt
-release from the [Ladybug GitHub releases](https://github.com/LadybugDB/ladybug/releases):
-
-```bash
-# Download the latest release for your platform
-curl -sL "https://github.com/LadybugDB/ladybug/releases/latest/download/liblbug-linux-x86_64.tar.gz" \
-  | tar xz -C /usr/local/lib/
-
-# Or use the vendored download script:
-LBUG_LIB_KIND=shared LBUG_TARGET_DIR=/usr/local/lib bash scripts/download-liblbug.sh
-```
-
-Set the `ladybug.lib_path` GUC to point at the library before using Cypher functions:
-
-```sql
-SET ladybug.lib_path = '/usr/local/lib/liblbug.so';
-```
-
-### Ladybug postgres extension
-
-To attach the current Postgres database to the Ladybug planner's catalog, the
-Ladybug postgres extension must be installed in Ladybug's extension cache. This
-happens automatically at runtime (`INSTALL postgres` + `LOAD postgres`) as long as
-`liblbug` can reach the Ladybug extension repository.
-
-If the automatic install fails, you can pre-install the extension by building
-[ladybug-extension/postgres](https://github.com/LadybugDB/ladybug-extension/tree/main/postgres).
-
 ## Quick start
 
+```bash
+# Build and install the extension
+make
+sudo make install
+
+# Start a test database
+createdb -p 5433 ladybug_test
+psql -p 5433 -d ladybug_test -c "CREATE EXTENSION pg_ladybug"
+
+# Or use the setup script
+bash scripts/setup-test-db.sh
+
+# Run the tests
+bash scripts/test.sh
+```
+
+## Manual test walkthrough
+
 ```sql
-CREATE EXTENSION pg_ladybug;
+-- Connect to the test database
+\c ladybug_test
 
--- Set the path to liblbug (do this once per session, or set in postgresql.conf)
-SET ladybug.lib_path = '/usr/local/lib/liblbug.so';
+-- Set liblbug path (adjust if liblbug is in a non-standard location)
+SET ladybug.lib_path = 'liblbug.so';
 
--- Connection string for the Ladybug catalog (uses the current session by default)
-SET ladybug.pg_connstr = 'host=/var/run/postgresql port=5432 dbname=mydb user=postgres';
+-- Set connection string for the Ladybug ATTACH
+SET ladybug.pg_connstr = 'host=/var/run/postgresql port=5433 dbname=ladybug_test user=postgres';
 
--- Create a table and register it as a Cypher node label
-CREATE TABLE persons (id SERIAL PRIMARY KEY, name TEXT, age INTEGER);
-INSERT INTO persons VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Carol', 35);
-
-SELECT ladybug.register_node('Person', 'persons', 'id');
-
--- Run Cypher
+-- --- Simple node MATCH ---
+-- Uses the node_person table (auto-detected by the postgres extension ATTACH)
 SELECT * FROM ladybug.cypher(
-  'MATCH (n:Person) RETURN n.name AS name, n.age AS age ORDER BY n.age'
+  'MATCH (n:node_person) RETURN n.name, n.age ORDER BY n.age'
 ) AS t(name text, age int);
 
 -- Output:
 --  name  | age
 -- -------+-----
 --  Bob   |  25
+--  Dave  |  28
 --  Alice |  30
 --  Carol |  35
 
--- Or just see what SQL the planner would push down:
-SELECT ladybug.pushed_sql('MATCH (n:Person) RETURN n.name, n.age ORDER BY n.age');
+-- --- Node MATCH with WHERE ---
+SELECT * FROM ladybug.cypher(
+  'MATCH (n:node_person) WHERE n.age > 28 RETURN n.name, n.age ORDER BY n.age'
+) AS t(name text, age int);
 
--- Result: SELECT name, age FROM persons ORDER BY age
+-- Output:
+--  name  | age
+-- -------+-----
+--  Alice |  30
+--  Carol |  35
+
+-- --- See the pushed SQL ---
+SELECT ladybug.pushed_sql(
+  'MATCH (n:node_person) WHERE n.age > 28 RETURN n.name, n.age ORDER BY n.age'
+);
+-- Returns: SELECT * FROM node_person WHERE age > 28 ORDER BY age
+
+-- --- Relationship pattern (requires rel_* auto-detection in Ladybug extension) ---
+-- When the Ladybug postgres extension has been modified to detect rel_* tables
+-- as relationship tables, this will work:
+SELECT * FROM ladybug.cypher(
+  'MATCH (a:node_person)-[r:rel_knows]->(b:node_person) RETURN a.name, b.name, r.since'
+) AS t(a_name text, b_name text, since int);
+```
+
+## Naming convention
+
+Tables with the following prefixes are automatically recognized:
+
+| Prefix   | Cypher role       | Example           |
+|----------|-------------------|-------------------|
+| `node_`  | Node label        | `node_person`     |
+| `rel_`   | Relationship      | `rel_knows`       |
+
+For `rel_*` tables, the source and destination node tables are determined by
+foreign key constraints on `src_id` and `dst_id` columns.
+
+You can also register tables manually without the naming convention using
+`ladybug.register_node()` and `ladybug.register_edge()`.
+
+## Test scripts
+
+```bash
+# Set up the test database with sample data
+bash scripts/setup-test-db.sh
+
+# Run the test suite
+bash scripts/test.sh
+
+# Options
+bash scripts/test.sh -p 5433 -d ladybug_test -v
 ```
 
 ## SQL reference
@@ -123,18 +145,36 @@ SELECT ladybug.pushed_sql('MATCH (n:Person) RETURN n.name, n.age ORDER BY n.age'
 | GUC | Default | Description |
 |---|---|---|
 | `ladybug.lib_path` | `liblbug.so` | Path to the Ladybug shared library (dlopen'd at runtime) |
-| `ladybug.pg_connstr` | `""` | Connection string used to ATTACH this Postgres to Ladybug's catalog (auto-derived if empty) |
+| `ladybug.pg_connstr` | `""` | Connection string used to ATTACH this Postgres to Ladybug's catalog |
 
-## How the bridge works
+## Architecture
 
-`ladybug_bridge.c` `dlopen`s `liblbug.so` at first use and resolves 19 C API
-entry points via `dlsym` (declared in Ladybug's `c_api/lbug.h`). It creates an
-in-memory Ladybug database, attaches the current Postgres as a foreign catalog
-(`dbtype POSTGRES`), then runs `EXPLAIN <cypher>` for each call. The pushed-down
-SQL is extracted from the plan text using the exact line-scanning algorithm from
-[Ladybug's notebook](https://github.com/LadybugDB/ladybug-icebug-notebook/blob/main/ladybug_duckdb_attached_starwars.ipynb)
-and executed via `SPI_execute`.
+```
+┌─────────────────────────────────────────────┐
+│          PostgreSQL backend                  │
+│                                              │
+│  Cypher query → ladybug.cypher()             │
+│       │                                      │
+│       ▼                                      │
+│  Ladybug planner (liblbug via dlopen)        │
+│    - Parse Cypher                            │
+│    - Optimize (ForeignJoinPushDown)          │
+│    - Produce EXPLAIN plan                    │
+│       │                                      │
+│       ▼                                      │
+│  extract_pushed_sql()                        │
+│    - Parse plan text                         │
+│    - Extract "Function:" section (SQL)       │
+│    - OR construct SELECT from plan nodes     │
+│       │                                      │
+│       ▼                                      │
+│  SPI_execute(pushed_sql)                     │
+│    - Native Postgres execution               │
+│    - Return rows via SRF                     │
+│                                              │
+└─────────────────────────────────────────────┘
+```
 
 ## License
 
-PostgreSQL License — same as Ladybug and pg_ddate.
+PostgreSQL License.
