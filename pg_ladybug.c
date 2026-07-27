@@ -59,6 +59,11 @@ extern char  *ladybug_bridge_direct_sql(LadybugBridge *b, const char *sql,
 extern bool   ladybug_bridge_attach_postgres(LadybugBridge *b,
                                              const char *pg_connstr,
                                              const char **err_msg);
+extern int    ladybug_bridge_execute_collect(LadybugBridge *b,
+                                             const char *query,
+                                             TupleDesc tupdesc,
+                                             HeapTuple **out_tuples,
+                                             const char **err_msg);
 extern void   ladybug_bridge_release(LadybugBridge *b);
 
 /* ------------------------------------------------------------------ */
@@ -227,90 +232,161 @@ ladybug_cypher(PG_FUNCTION_ARGS)
         cypher_cstr = text_to_cstring(cypher_text);
         err_msg = NULL;
         sql = ladybug_bridge_pushed_sql(b, cypher_cstr, &err_msg);
-        pfree(cypher_cstr);
-        if (sql == NULL)
+
+        if (sql != NULL)
         {
-            MemoryContextSwitchTo(oldcontext);
-            if (err_msg)
-                ereport(ERROR,
-                        (errmsg("ladybug: could not extract pushed-down SQL"),
-                         errdetail("%s", err_msg),
-                         errhint("Use ladybug.explain() or ladybug.pushed_sql() to inspect.")));
-            else
-                ereport(ERROR,
-                        (errmsg("ladybug: could not extract pushed-down SQL")));
-        }
+            /* ----------------------------------------------------------------
+             * Pushdown available: execute the SQL via native SPI on this
+             * Postgres backend.
+             * ----------------------------------------------------------------
+             */
+            pfree(cypher_cstr);
 
-        /* Execute SQL via SPI and copy all row data into multi-call memory context */
-        nrows = spi_execute_and_capture(sql, expected_tupdesc, &tuptable, &ncols);
-        pfree(sql);
+            /* Execute SQL via SPI and copy all row data into multi-call memory context */
+            nrows = spi_execute_and_capture(sql, expected_tupdesc, &tuptable, &ncols);
+            pfree(sql);
 
-        srfctx->nrows = nrows;
-        funcctx->max_calls = nrows;
-        /*
-         * Build HeapTuples BEFORE SPI_finish, because SPI_getbinval may
-         * return pointers into SPI memory that would be freed by SPI_finish.
-         * Store the Datum representation of each HeapTuple in multi-call ctx.
-         */
-        if (nrows > 0 && tuptable != NULL)
-        {
-            TupleDesc spi_tupdesc = tuptable->tupdesc;
-            /* Build column name mapping from SPI result columns to expected */
-            int *col_map = (int *) palloc(ncols * sizeof(int));
-            for (int a = 0; a < ncols; a++)
+            srfctx->nrows = nrows;
+            funcctx->max_calls = nrows;
+            /*
+             * Build HeapTuples BEFORE SPI_finish, because SPI_getbinval may
+             * return pointers into SPI memory that would be freed by SPI_finish.
+             * Store the Datum representation of each HeapTuple in multi-call ctx.
+             */
+            if (nrows > 0 && tuptable != NULL)
             {
-                const char *exp_name;
-
-                col_map[a] = -1;
-                exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
-                for (int b = 0; b < ncols; b++)
-                {
-                    const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
-                    if (strcmp(exp_name, spi_name) == 0)
-                    {
-                        col_map[a] = b;
-                        break;
-                    }
-                }
-                if (col_map[a] < 0)
-                    col_map[a] = a; /* fallback to positional */
-            }
-
-            for (int i = 0; i < nrows && i < MAX_COLS; i++)
-            {
-                HeapTuple spi_tup;
-                Datum *vals;
-                bool  *nls;
-                HeapTuple ht;
-
-                spi_tup = tuptable->vals[i];
-                vals = (Datum *) palloc(ncols * sizeof(Datum));
-                nls  = (bool  *) palloc(ncols * sizeof(bool));
-
+                TupleDesc spi_tupdesc = tuptable->tupdesc;
+                /* Build column name mapping from SPI result columns to expected */
+                int *col_map = (int *) palloc(ncols * sizeof(int));
                 for (int a = 0; a < ncols; a++)
                 {
-                    int spi_idx;
-                    bool isnull;
+                    const char *exp_name;
 
-                    spi_idx = col_map[a];
-                    isnull = false;
-                    vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
-                    nls[a] = isnull;
+                    col_map[a] = -1;
+                    exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
+                    for (int b = 0; b < ncols; b++)
+                    {
+                        const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
+                        if (strcmp(exp_name, spi_name) == 0)
+                        {
+                            col_map[a] = b;
+                            break;
+                        }
+                    }
+                    if (col_map[a] < 0)
+                        col_map[a] = a; /* fallback to positional */
                 }
 
-                /* Build the heap tuple now, while SPI data is still valid */
-                ht = heap_form_tuple(expected_tupdesc, vals, nls);
-                srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
-                srfctx->values[i][0] = HeapTupleGetDatum(ht);
-                srfctx->nulls[i] = NULL;
+                for (int i = 0; i < nrows && i < MAX_COLS; i++)
+                {
+                    HeapTuple spi_tup;
+                    Datum *vals;
+                    bool  *nls;
+                    HeapTuple ht;
 
-                pfree(vals);
-                pfree(nls);
+                    spi_tup = tuptable->vals[i];
+                    vals = (Datum *) palloc(ncols * sizeof(Datum));
+                    nls  = (bool  *) palloc(ncols * sizeof(bool));
+
+                    for (int a = 0; a < ncols; a++)
+                    {
+                        int spi_idx;
+                        bool isnull;
+
+                        spi_idx = col_map[a];
+                        isnull = false;
+                        vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                        nls[a] = isnull;
+                    }
+
+                    /* Build the heap tuple now, while SPI data is still valid */
+                    ht = heap_form_tuple(expected_tupdesc, vals, nls);
+                    srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
+                    srfctx->values[i][0] = HeapTupleGetDatum(ht);
+                    srfctx->nulls[i] = NULL;
+
+                    pfree(vals);
+                    pfree(nls);
+                }
+                pfree(col_map);
             }
-            pfree(col_map);
+
+            SPI_finish();
+        }
+        else
+        {
+            /* ----------------------------------------------------------------
+             * No pushdown available (e.g., a query like "RETURN 1" that has
+             * no SQL to push down, or a complex query the planner chose not
+             * to push down).  Fall back to executing the cypher as-is via
+             * the Ladybug engine and stream the result rows back as if the
+             * corresponding native SQL had been executed.
+             *
+             * Discard the informational err_msg from pushed_sql; the bridge
+             * sets it whenever the function returns NULL, regardless of
+             * whether the cause was "no pushdown" or a real error.  Any
+             * real error will surface again from the direct execution below.
+             * ----------------------------------------------------------------
+             */
+            HeapTuple *tuples = NULL;
+            int       nrows_lbug;
+
+            if (err_msg)
+            {
+                pfree((char *) err_msg);
+                err_msg = NULL;
+            }
+
+            err_msg = NULL;
+            nrows_lbug = ladybug_bridge_execute_collect(
+                                            b, cypher_cstr,
+                                            expected_tupdesc,
+                                            &tuples, &err_msg);
+            pfree(cypher_cstr);
+
+            if (nrows_lbug < 0)
+            {
+                MemoryContextSwitchTo(oldcontext);
+                if (err_msg)
+                    ereport(ERROR,
+                            (errmsg("ladybug: failed to execute cypher via "
+                                    "Ladybug engine (no pushdown SQL was "
+                                    "available and direct execution failed)"),
+                             errdetail("%s", err_msg),
+                             errhint("Use ladybug.explain() to inspect the "
+                                     "plan, or ladybug.pushed_sql() to see "
+                                     "what SQL (if any) the planner would "
+                                     "have pushed down.")));
+                else
+                    ereport(ERROR,
+                            (errmsg("ladybug: failed to execute cypher via "
+                                    "Ladybug engine (no pushdown SQL was "
+                                    "available and direct execution failed)")));
+                /* ereport(ERROR) does not return */
+            }
+
+            srfctx->nrows = nrows_lbug;
+            funcctx->max_calls = nrows_lbug;
+
+            /*
+             * Wrap each returned HeapTuple in a single-element Datum array,
+             * matching the layout produced by the SPI path above so the
+             * SRF per-call code can use a single accessor.
+             *
+             * The HeapTuples are already palloc'd in the multi-call memory
+             * context (we set that context before calling the bridge), so
+             * they survive until the SRF completes.
+             */
+            for (int i = 0; i < nrows_lbug && i < MAX_COLS; i++)
+            {
+                srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
+                srfctx->values[i][0] = HeapTupleGetDatum(tuples[i]);
+                srfctx->nulls[i] = NULL;
+            }
+            if (tuples != NULL)
+                pfree(tuples);
         }
 
-        SPI_finish();
         MemoryContextSwitchTo(oldcontext);
     }
 

@@ -182,7 +182,26 @@ pg_ladybug + pg_client, and run the full test suite.
 | `ladybug.pg_connstr` | `""` | Connection string used to ATTACH this Postgres to Ladybug's catalog via pg_client |
 | `ladybug.storage_path` | `<DataDir>/storage.lbdb` | Filesystem path for the persistent Ladybug storage. The Ladybug engine uses this path for its catalog (table/schema metadata) instead of the in-memory default. If initialization at this path fails, the extension falls back to in-memory mode and emits a `WARNING`. Set to an empty string to disable persistent storage. The path is read once per backend on the first call to a function that needs the Ladybug engine. |
 
-## Architecture
+## Execution strategies
+
+`ladybug.cypher()` tries two strategies when executing a Cypher query:
+
+1. **Pushdown (default).** The cypher is handed to the embedded Ladybug
+   planner, which extracts a pushed-down SQL string. That SQL is then run
+   natively by PostgreSQL via SPI, and the rows are streamed back through
+   the SRF. This is the fastest path and is the only one that lets the
+   engine plan across multiple Cypher patterns (e.g. multi-hop matches).
+2. **Direct execution (fallback).** If the planner reports that no
+   pushdown is possible for the cypher (for example `RETURN 1`,
+   `UNWIND [1, 2, 3] AS x RETURN x`, or any cypher that produces values
+   the planner cannot translate to plain SQL), `ladybug.cypher()` falls
+   back to executing the cypher as-is through the Ladybug engine and
+   returning the result rows as if a corresponding native SQL query had
+   been run. Each row is converted from the engine's internal value type
+   to a PG `Datum` via the column's input function.
+
+Use `ladybug.pushed_sql()` and `ladybug.explain()` to inspect which
+strategy was used for a given query.
 
 ```
 ┌─────────────────────────────────────────────┐

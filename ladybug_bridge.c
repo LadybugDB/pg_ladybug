@@ -57,6 +57,7 @@ char  *ladybug_bridge_pushed_sql(LadybugBridge *b, const char *cypher, const cha
 char  *ladybug_bridge_explain(LadybugBridge *b, const char *cypher, const char **err_msg);
 char  *ladybug_bridge_execute_query(LadybugBridge *b, const char *query, const char **err_msg);
 int    ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b, const char *query, Tuplestorestate *ts, TupleDesc tupdesc, const char **err_msg);
+int    ladybug_bridge_execute_collect(LadybugBridge *b, const char *query, TupleDesc tupdesc, HeapTuple **out_tuples, const char **err_msg);
 void   ladybug_bridge_release(LadybugBridge *b);
 
 /* ================================================================ */
@@ -578,6 +579,192 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
 
     lbug_query_result_destroy(&result);
     return nrows;
+}
+
+/*
+ * ladybug_bridge_execute_collect - run a query through the Ladybug
+ * connection and return the result rows as a palloc'd array of
+ * HeapTuples, allocated in the current memory context.  Each
+ * HeapTuple conforms to the caller's TupleDesc.
+ *
+ * Returns the number of tuples (>= 0) on success, or -1 on error.
+ * On success, *out_tuples is set to a palloc'd array of HeapTuple
+ * pointers (NULL if zero rows).  On error, *out_tuples is unchanged.
+ *
+ * This is the natural complement to ladybug_bridge_pushed_sql() for
+ * queries where the planner has no pushdown SQL to extract (e.g.,
+ * "RETURN 1") and the cypher must be executed as-is via the engine.
+ */
+int
+ladybug_bridge_execute_collect(LadybugBridge *b,
+                                const char *query,
+                                TupleDesc tupdesc,
+                                HeapTuple **out_tuples,
+                                const char **err_msg)
+{
+    lbug_query_result result;
+    lbug_state st;
+    char *lbug_err;
+    int num_cols;
+    int natts;
+    HeapTuple *tuples = NULL;
+    int ntuples = 0;
+    int tuples_alloc = 0;
+
+    /* Defensive defaults so we can use *out_tuples safely on any return. */
+    if (out_tuples)
+        *out_tuples = NULL;
+
+    if (b == NULL || !b->inited)
+    {
+        if (err_msg) *err_msg = pstrdup("ladybug: bridge not initialized");
+        return -1;
+    }
+    if (query == NULL)
+    {
+        if (err_msg) *err_msg = pstrdup("ladybug: query is NULL");
+        return -1;
+    }
+    if (tupdesc == NULL)
+    {
+        if (err_msg) *err_msg = pstrdup("ladybug: tupdesc is NULL");
+        return -1;
+    }
+    if (out_tuples == NULL)
+    {
+        if (err_msg) *err_msg = pstrdup("ladybug: out_tuples is NULL");
+        return -1;
+    }
+
+    memset(&result, 0, sizeof(result));
+
+    st = lbug_connection_query(&b->connection, query, &result);
+    if (st != 0 || !lbug_query_result_is_success(&result))
+    {
+        lbug_err = lbug_query_result_get_error_message(&result);
+        if (err_msg)
+            *err_msg = psprintf("ladybug: query failed: %s",
+                                lbug_err ? lbug_err : "(no error message)");
+        if (lbug_err)
+            lbug_destroy_string(lbug_err);
+        lbug_query_result_destroy(&result);
+        return -1;
+    }
+
+    num_cols = (int)lbug_query_result_get_num_columns(&result);
+    natts = tupdesc->natts;
+
+    if (num_cols != natts)
+    {
+        if (err_msg)
+            *err_msg = psprintf("ladybug: column count mismatch: query returns %d columns, expected %d",
+                                num_cols, natts);
+        lbug_query_result_destroy(&result);
+        return -1;
+    }
+
+    while (lbug_query_result_has_next(&result))
+    {
+        lbug_flat_tuple flat_tuple;
+        Datum *values;
+        bool  *nulls;
+        HeapTuple tuple;
+
+        memset(&flat_tuple, 0, sizeof(flat_tuple));
+
+        st = lbug_query_result_get_next(&result, &flat_tuple);
+        if (st != 0)
+        {
+            if (err_msg)
+                *err_msg = pstrdup("ladybug: error fetching next tuple");
+            if (tuples)
+            {
+                for (int i = 0; i < ntuples; i++)
+                    pfree(tuples[i]);
+                pfree(tuples);
+            }
+            lbug_query_result_destroy(&result);
+            *out_tuples = NULL;
+            return -1;
+        }
+
+        values = (Datum *) palloc0(natts * sizeof(Datum));
+        nulls  = (bool  *) palloc0(natts * sizeof(bool));
+
+        for (int a = 0; a < natts; a++)
+        {
+            lbug_value val;
+            char *str;
+
+            memset(&val, 0, sizeof(val));
+
+            st = lbug_flat_tuple_get_value(&flat_tuple, (uint64_t)a, &val);
+            if (st != 0 || lbug_value_is_null(&val))
+            {
+                nulls[a] = true;
+                values[a] = (Datum) 0;
+                continue;
+            }
+
+            str = NULL;
+            st = lbug_value_get_string(&val, &str);
+            if (st != 0 || str == NULL)
+                str = lbug_value_to_string(&val);
+
+            if (str != NULL)
+            {
+                Oid typid, typioparam, typinput;
+                int32 typmod;
+                FmgrInfo finfo;
+
+                typid = TupleDescAttr(tupdesc, a)->atttypid;
+                typmod = TupleDescAttr(tupdesc, a)->atttypmod;
+                getTypeInputInfo(typid, &typinput, &typioparam);
+                fmgr_info(typinput, &finfo);
+
+                values[a] = InputFunctionCall(&finfo, str, typioparam, typmod);
+                nulls[a] = false;
+
+                lbug_destroy_string(str);
+            }
+            else
+            {
+                nulls[a] = true;
+                values[a] = (Datum) 0;
+            }
+        }
+
+        tuple = heap_form_tuple(tupdesc, values, nulls);
+        pfree(values);
+        pfree(nulls);
+
+        /*
+         * Grow the output array as needed (start at 8, double
+         * thereafter).  We must use palloc() for the very first
+         * allocation: PG's repalloc() asserts on a NULL pointer in
+         * some builds, while it works fine in others.  palloc() is
+         * always safe and equivalent for the empty -> non-empty
+         * transition.
+         */
+        if (ntuples >= tuples_alloc)
+        {
+            int new_alloc = tuples_alloc ? tuples_alloc * 2 : 8;
+            HeapTuple *new_tuples;
+
+            if (tuples == NULL)
+                new_tuples = (HeapTuple *) palloc(new_alloc * sizeof(HeapTuple));
+            else
+                new_tuples = (HeapTuple *) repalloc(tuples,
+                                                   new_alloc * sizeof(HeapTuple));
+            tuples = new_tuples;
+            tuples_alloc = new_alloc;
+        }
+        tuples[ntuples++] = tuple;
+    }
+
+    lbug_query_result_destroy(&result);
+    *out_tuples = tuples;
+    return ntuples;
 }
 
 void

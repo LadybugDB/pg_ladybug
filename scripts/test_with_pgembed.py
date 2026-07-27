@@ -12,6 +12,7 @@ This script:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -159,10 +160,32 @@ def main() -> int:
                      f"SET ladybug.pg_connstr = '{libpq_connstr}'; SELECT ladybug.explain('RETURN 1')",
                      env, check=lambda o, e: "PROJECTION" in o or "RESULT" in o)
 
-            # pushed_sql RETURN 1 - validates SQL extraction
-            run_test("Bridge: pushed_sql RETURN 1",
-                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; SELECT ladybug.pushed_sql('RETURN 1')",
-                     env, check=lambda o, e: len(o) > 20)
+            # pushed_sql RETURN 1 - validates that pushed_sql correctly reports
+            # "no pushdown SQL" for queries the planner cannot translate.
+            # The expected behavior is an ERROR (the user explicitly asked for
+            # pushed SQL, so we should report that none exists rather than
+            # silently executing via the engine).  Use psql directly to
+            # inspect the error message, since the runner treats any non-zero
+            # exit code as a failure.
+            print(f"\n--- Test 7: Bridge: pushed_sql RETURN 1 (expected error) ---")
+            tests_total += 1
+            result = subprocess.run(
+                ["psql", "-c",
+                 f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                 "SELECT ladybug.pushed_sql('RETURN 1')"],
+                env=env, capture_output=True, text=True,
+            )
+            # Expected: non-zero exit code, error message mentions
+            # "no pushdown operator found in plan".
+            if (result.returncode != 0
+                    and result.stderr
+                    and "no pushdown operator found in plan" in result.stderr):
+                print("PASS (got expected 'no pushdown' error)")
+                tests_passed += 1
+            else:
+                print(f"FAIL: expected error mentioning 'no pushdown', got "
+                      f"rc={result.returncode}, stderr={result.stderr!r}")
+                # do not increment tests_passed
 
             # ================================================================
             # Tests 7: Full Cypher flow with MATCH via pg_client
@@ -189,29 +212,55 @@ def main() -> int:
                      "AS t(name text, age int)",
                      env, check=lambda o, e: "25" in o and "30" in o and "35" in o)
 
-            # WHERE clause: known limitation in extract_pushed_sql plan parsing
-            # The plan text filter section parsing produces malformed SQL.
-            # This is a pre-existing issue, not related to compile-time linking.
-            print(f"\n--- Test {tests_total + 1}: Cypher: MATCH with WHERE (known limitation) ---")
-            tests_total += 1
-            result = subprocess.run(
-                ["psql", "-c",
-                 f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
-                 "SELECT * FROM ladybug.cypher('MATCH (n:node_person) WHERE n.age > 28 RETURN n.name, n.age') "
-                 "AS t(name text, age int) ORDER BY name"],
-                env=env, capture_output=True, text=True,
-            )
-            # This may fail due to malformed SQL from plan parsing
-            if result.returncode == 0 and "Alice" in (result.stdout or ""):
-                tests_passed += 1
-                print("PASS")
-            else:
-                print(f"SKIP (WHERE plan parsing known issue: {(result.stderr or '')[:100]})")
+            # ================================================================
+            # Test 10b: cypher() fallback for queries without pushdown
+            # Queries like "RETURN 1" have no pushdown SQL; the function
+            # should fall back to executing the cypher as-is via the
+            # Ladybug engine and return the result like a native SELECT.
+            # ================================================================
+            def check_value(expected, col_name):
+                """Check the first data row of a single-column psql output
+                contains the expected value (handles aligned/spaced output)."""
+                def check(o, e):
+                    # Look for a row that, after stripping non-digits/minus
+                    # for the named column, equals the expected value.
+                    pattern = r"\b" + re.escape(expected) + r"\b"
+                    return re.search(pattern, o) is not None
+                return check
+
+            run_test("Cypher fallback: RETURN 1 (single column)",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher('RETURN 1') AS t(x int)",
+                     env, check=check_value("1", "x"))
+
+            run_test("Cypher fallback: RETURN 1+2 (expression)",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher('RETURN 1 + 2 AS sum') AS t(sum int)",
+                     env, check=check_value("3", "sum"))
+
+            run_test("Cypher fallback: UNWIND multiple rows",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT count(*)::int AS cnt FROM ladybug.cypher('UNWIND [10, 20, 30] AS x RETURN x') AS t(x int)",
+                     env, check=check_value("3", "cnt"))
+
+            run_test("Cypher fallback: RETURN string literal",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher('RETURN \"hello\" AS msg') AS t(msg text)",
+                     env, check=check_value("hello", "msg"))
+
+            # WHERE clause: the planner pushes the query down to a single
+            # SELECT against node_person, which the SPI path executes
+            # natively.  No special handling required.
+            run_test("Cypher: MATCH with WHERE",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher('MATCH (n:node_person) WHERE n.age > 28 RETURN n.name, n.age') "
+                     "AS t(name text, age int) ORDER BY name",
+                     env, check=lambda o, e: ("Alice" in o and "Carol" in o
+                                              and "Bob" not in o and "Dave" not in o))
 
             print(f"\n=== {tests_passed}/{tests_total} tests passed ===")
-            # Tests 1-9 are required. Test 10 (WHERE) is a known plan parsing
-            # limitation in extract_pushed_sql, not a compile-time linking issue.
-            if tests_passed >= 8:
+            # All 15 tests are required.
+            if tests_passed >= tests_total:
                 print("All essential tests PASSED - compile-time linking works!")
                 return 0
             return 1
