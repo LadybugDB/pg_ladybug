@@ -59,357 +59,6 @@ void   ladybug_bridge_release(LadybugBridge *b);
 /*  Internal helpers                                                 */
 /* ================================================================ */
 
-/*
- * Strip the box-drawing character 0x2502 from a (possibly wide) line,
- * plus leading/trailing whitespace.  Returns a freshly palloc'd string.
- */
-static char *
-clean_plan_line(const char *line)
-{
-    StringInfoData buf;
-    const unsigned char *p;
-    bool started;
-    int last_non_space_end;
-
-    initStringInfo(&buf);
-    p = (const unsigned char *) line;
-    started = false;
-    last_non_space_end = 0;
-
-    while (*p)
-    {
-        if (p[0] == 0xE2 && p[1] == 0x94 && p[2] == 0x82)
-        {
-            p += 3;
-            continue;
-        }
-        if (!started && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
-        {
-            p++;
-            continue;
-        }
-        started = true;
-        appendStringInfoCharMacro(&buf, (char) *p);
-        if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
-            last_non_space_end = buf.len;
-        p++;
-    }
-
-    if (last_non_space_end < buf.len)
-        buf.data[last_non_space_end] = '\0';
-
-    return buf.data;
-}
-
-/*
- * Extract the pushed-down SQL from an EXPLAIN plan text.
- *
- * Strategy:
- * 1. Look for "Function:" section (from ForeignJoinPushDownOptimizer).
- *    If found, capture text after it (the full SQL pushed down).
- * 2. If no "Function:" section, construct a SELECT query from the
- *    SCAN_NODE_TABLE (table name, properties) and ORDER_BY sections.
- *
- * Returns a palloc'd SQL string, or NULL on failure.
- */
-static char *
-extract_pushed_sql(const char *plan_text)
-{
-    if (plan_text == NULL || plan_text[0] == '\0')
-        return NULL;
-
-    /* First pass: try to find a "Function:" section (foreign pushdown) */
-    {
-        StringInfoData result;
-        bool capturing;
-        bool first_part;
-        bool found_function;
-        const char *line_start;
-
-        initStringInfo(&result);
-        capturing = false;
-        first_part = true;
-        found_function = false;
-        line_start = plan_text;
-        while (line_start && *line_start)
-        {
-            const char *line_end = strchr(line_start, '\n');
-            size_t line_len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-            char *line = pnstrdup(line_start, line_len);
-
-            if (!capturing && strstr(line, "Function:") != NULL)
-            {
-                char *after;
-                char *cleaned;
-
-                found_function = true;
-                after = strstr(line, "Function:");
-                after += strlen("Function:");
-                cleaned = clean_plan_line(after);
-                if (cleaned[0] != '\0')
-                {
-                    if (!first_part)
-                        appendStringInfoChar(&result, ' ');
-                    appendStringInfoString(&result, cleaned);
-                    first_part = false;
-                }
-                pfree(cleaned);
-                capturing = true;
-            }
-            else if (capturing)
-            {
-                char *cleaned;
-
-                if (strstr(line, "Expressions:") != NULL ||
-                    strstr(line, "NumOutputTuples:") != NULL)
-                {
-                    pfree(line);
-                    break;
-                }
-                cleaned = clean_plan_line(line);
-                if (cleaned[0] != '\0')
-                {
-                    if (!first_part)
-                        appendStringInfoChar(&result, ' ');
-                    appendStringInfoString(&result, cleaned);
-                    first_part = false;
-                }
-                pfree(cleaned);
-            }
-
-            pfree(line);
-            line_start = line_end ? line_end + 1 : NULL;
-        }
-
-        if (found_function && result.len > 0)
-            return result.data;
-        if (found_function)
-        {
-            pfree(result.data);
-            return NULL;
-        }
-        pfree(result.data);
-    }
-
-    /* Second pass: no "Function:" section found.  Construct a simple
-     * SELECT * FROM <table> [WHERE <conditions>] [ORDER BY ...].
-     */
-    {
-        StringInfoData from_table;
-        StringInfoData where_clause;
-        StringInfoData order_by;
-        bool order_first;
-        bool got_order_by;
-        bool in_filter;
-        StringInfoData filter_text;
-        const char *line_start;
-
-        initStringInfo(&from_table);
-        initStringInfo(&where_clause);
-        initStringInfo(&order_by);
-        order_first = true;
-        got_order_by = false;
-        in_filter = false;
-        initStringInfo(&filter_text);
-        line_start = plan_text;
-        while (line_start && *line_start)
-        {
-            const char *line_end = strchr(line_start, '\n');
-            size_t line_len = line_end ? (size_t)(line_end - line_start) : strlen(line_start);
-            char *line = pnstrdup(line_start, line_len);
-            char *cleaned = clean_plan_line(line);
-
-            if (cleaned[0] != '\0')
-            {
-                char *uc = cleaned;
-                if (strstr(uc, "FILTER[") != NULL ||
-                    strstr(uc, "FILTER [") != NULL)
-                {
-                    in_filter = true;
-                }
-                else if (in_filter)
-                {
-                    if (strstr(uc, "NumOutputTuples:") != NULL ||
-                        strstr(uc, "ExecutionTime:") != NULL ||
-                        strstr(uc, "Tables:") != NULL ||
-                        strstr(uc, "Order By:") != NULL ||
-                        strstr(uc, "Expressions:") != NULL ||
-                        strstr(uc, "SCAN_") != NULL ||
-                        strstr(uc, "PROJECTION") != NULL ||
-                        strstr(uc, "EXTEND") != NULL ||
-                        strstr(uc, "HASH_JOIN") != NULL)
-                    {
-                        in_filter = false;
-                    }
-                    else
-                    {
-                        if (filter_text.len > 0)
-                            appendStringInfoChar(&filter_text, ' ');
-                        appendStringInfoString(&filter_text, uc);
-                    }
-                }
-
-                if (strstr(uc, "Tables:") != NULL)
-                {
-                    char *t = strstr(uc, "Tables:");
-                    t += strlen("Tables:");
-                    while (*t == ' ') t++;
-                    if (from_table.len == 0)
-                        appendStringInfoString(&from_table, t);
-                }
-
-                if (!got_order_by && strstr(uc, "Order By:") != NULL)
-                {
-                    char *o, *ord, *end;
-                    char saved;
-                    got_order_by = true;
-                    o = strstr(uc, "Order By:");
-                    o += strlen("Order By:");
-                    while (*o == ' ') o++;
-                    ord = o;
-                    while (*ord)
-                    {
-                        char *col, *dot;
-                        while (*ord == ' ') ord++;
-                        if (*ord == '\0') break;
-                        end = ord;
-                        while (*end && *end != ',' && *end != '\n' && *end != '\r') end++;
-                        saved = *end;
-                        *end = '\0';
-                        col = ord;
-                        dot = strchr(col, '.');
-                        if (dot) col = dot + 1;
-                        if (!order_first)
-                            appendStringInfoString(&order_by, ", ");
-                        appendStringInfoString(&order_by, col);
-                        order_first = false;
-                        *end = saved;
-                        ord = end;
-                        if (*ord == ',') ord++;
-                    }
-                }
-            }
-            pfree(cleaned);
-            pfree(line);
-            line_start = line_end ? line_end + 1 : NULL;
-        }
-
-        if (filter_text.len > 0)
-        {
-            char *fp = filter_text.data;
-            char *where_result = NULL;
-            const char *op = NULL;
-
-            if (strstr(fp, "GREATER_THAN_EQUALS") || strstr(fp, "GREATER_EQUALS"))
-                op = ">=";
-            else if (strstr(fp, "GREATER_THAN"))
-                op = ">";
-            else if (strstr(fp, "LESS_THAN_EQUALS") || strstr(fp, "LESS_EQUALS"))
-                op = "<=";
-            else if (strstr(fp, "LESS_THAN"))
-                op = "<";
-            else if (strstr(fp, "NOT_EQUALS"))
-                op = "<>";
-            else if (strstr(fp, "EQUALS") || strstr(fp, "EQUALS_TO"))
-                op = "=";
-
-            if (op != NULL)
-            {
-                char *open_paren = strchr(fp, '(');
-                char *close_paren = strrchr(fp, ')');
-                if (open_paren && close_paren && close_paren > open_paren)
-                {
-                    size_t inner_len = close_paren - open_paren - 1;
-                    char *inner = pnstrdup(open_paren + 1, inner_len);
-                    char *clean = pstrdup(inner);
-                    char *src = inner, *dst = clean;
-                    while (*src)
-                    {
-                        if (strncmp(src, "CAST(", 5) == 0)
-                        {
-                            int d;
-                            src += 5;
-                            d = 1;
-                            while (*src && d > 0)
-                            {
-                                if (*src == '(') d++;
-                                if (*src == ')') d--;
-                                if (d > 0) { *dst = *src; dst++; src++; }
-                                else { src++; }
-                            }
-                        }
-                        else { *dst = *src; dst++; src++; }
-                    }
-                    *dst = '\0';
-
-                    {
-                        char *left_s, *mid_s, *right_s, *l, *dot;
-                        size_t rl;
-                        left_s = clean;
-                        while (*left_s == ' ') left_s++;
-                        mid_s = left_s;
-                        while (*mid_s && *mid_s != ' ') mid_s++;
-                        if (*mid_s == ' ')
-                        {
-                            *mid_s = '\0';
-                            mid_s++;
-                            while (*mid_s == ' ') mid_s++;
-                            right_s = mid_s;
-                            rl = strlen(right_s);
-                            while (rl > 0 && (right_s[rl-1] == ')' || right_s[rl-1] == ' '))
-                                right_s[--rl] = '\0';
-                            l = left_s;
-                            dot = strchr(l, '.');
-                            if (dot) l = dot + 1;
-                            where_result = psprintf("%s %s %s", l, op, right_s);
-                        }
-                    }
-                    pfree(inner);
-                    pfree(clean);
-                }
-            }
-
-            if (where_result != NULL)
-            {
-                appendStringInfoString(&where_clause, where_result);
-                pfree(where_result);
-            }
-            else
-                appendStringInfoString(&where_clause, fp);
-        }
-        pfree(filter_text.data);
-
-        if (from_table.len == 0)
-        {
-            pfree(from_table.data);
-            pfree(where_clause.data);
-            pfree(order_by.data);
-            return NULL;
-        }
-
-        {
-            StringInfoData sql;
-            initStringInfo(&sql);
-            appendStringInfoString(&sql, "SELECT * FROM ");
-            appendStringInfoString(&sql, from_table.data);
-            if (where_clause.len > 0)
-            {
-                appendStringInfoString(&sql, " WHERE ");
-                appendStringInfoString(&sql, where_clause.data);
-            }
-            if (order_by.len > 0)
-            {
-                appendStringInfoString(&sql, " ORDER BY ");
-                appendStringInfoString(&sql, order_by.data);
-            }
-            pfree(from_table.data);
-            pfree(where_clause.data);
-            pfree(order_by.data);
-            return sql.data;
-        }
-    }
-}
-
 /* ================================================================ */
 /*  Public bridge API (used by pg_ladybug.c)                         */
 /* ================================================================ */
@@ -617,16 +266,16 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
 
 /*
  * Run EXPLAIN <cypher> through Ladybug and extract the pushed-down SQL.
+ * Uses the new C API function lbug_connection_get_pushed_sql() which walks
+ * the logical plan directly, rather than parsing the textual EXPLAIN output.
  * Returns a palloc'd SQL string, or NULL if no pushdown was possible
  * (with *err_msg set to a descriptive message).
  */
 char *
 ladybug_bridge_pushed_sql(LadybugBridge *b, const char *cypher, const char **err_msg)
 {
-    StringInfoData explain_sql;
-    const char *e;
-    char *plan_text;
     char *sql;
+    lbug_state st;
 
     if (b == NULL)
     {
@@ -634,35 +283,31 @@ ladybug_bridge_pushed_sql(LadybugBridge *b, const char *cypher, const char **err
         return NULL;
     }
 
-    initStringInfo(&explain_sql);
-    appendStringInfoString(&explain_sql, "EXPLAIN ");
-    appendStringInfoString(&explain_sql, cypher);
-
-    e = NULL;
-    plan_text = ladybug_bridge_direct_sql(b, explain_sql.data, &e);
-    pfree(explain_sql.data);
-
-    if (plan_text == NULL)
+    st = lbug_connection_get_pushed_sql(&b->connection, cypher, &sql);
+    if (st != LbugSuccess || sql == NULL)
     {
-        if (err_msg) *err_msg = e;
-        else if (e) pfree((char *)e);
-        return NULL;
-    }
+        char *lbug_err;
 
-    sql = extract_pushed_sql(plan_text);
-    pfree(plan_text);
-
-    if (sql == NULL)
-    {
+        lbug_err = lbug_get_last_error();
         if (err_msg)
-            *err_msg = pstrdup("ladybug: no pushed-down SQL found in EXPLAIN plan "
-                                "(pattern may not be fully pushable). "
-                                "Use ladybug.explain() for the full plan, or "
-                                "ladybug.pushed_sql() to inspect extraction.");
+        {
+            if (lbug_err)
+                *err_msg = psprintf("ladybug: could not extract pushed-down SQL: %s", lbug_err);
+            else
+                *err_msg = pstrdup("ladybug: could not extract pushed-down SQL "
+                                    "(no pushdown operator found in plan). "
+                                    "Use ladybug.explain() for the full plan.");
+        }
+        if (lbug_err) lbug_destroy_string(lbug_err);
         return NULL;
     }
 
-    return sql;
+    /* sql is now an lbug-allocated string; copy it to palloc'd memory */
+    {
+        char *copy = pstrdup(sql);
+        lbug_destroy_string(sql);
+        return copy;
+    }
 }
 
 /*
