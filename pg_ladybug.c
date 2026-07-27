@@ -36,6 +36,7 @@
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 #include "utils/tuplestore.h"
+#include "miscadmin.h"              /* DataDir */
 #include "catalog/pg_type.h"
 #include "access/htup_details.h"
 #include "nodes/execnodes.h"
@@ -64,6 +65,19 @@ extern void   ladybug_bridge_release(LadybugBridge *b);
 /* GUCs                                                               */
 /* ------------------------------------------------------------------ */
 static char *ladybug_pg_connstr = "";
+static char *ladybug_storage_path = NULL;
+
+/*
+ * Default storage path, computed in _PG_init from DataDir.
+ * The Ladybug engine uses this path for persistent storage of
+ * its catalog (table/schema metadata, not graph data). The
+ * bridge tries to initialize at this path and falls back to
+ * in-memory mode if the path is empty or initialization fails.
+ *
+ * Format: <DataDir>/storage.lbdb
+ */
+#define LADYBUG_DEFAULT_STORAGE_PATH_BUFSIZE 1024
+static char ladybug_default_storage_path[LADYBUG_DEFAULT_STORAGE_PATH_BUFSIZE];
 
 /* ------------------------------------------------------------------ */
 /* SRF execution context for row streaming                             */
@@ -552,6 +566,37 @@ ladybug_pushed_sql(PG_FUNCTION_ARGS)
 void
 _PG_init(void)
 {
+    /*
+     * Compute the default storage path: <DataDir>/storage.lbdb.
+     * The static buffer is used as the bootValue for the GUC; the GUC
+     * framework copies it to a palloc'd buffer it owns, so the static
+     * buffer is never freed.
+     */
+    {
+        const char *dir = DataDir;
+        size_t      len = (dir != NULL) ? strlen(dir) : 0;
+
+        if (len == 0)
+        {
+            /* No DataDir available; fall back to a relative path. */
+            snprintf(ladybug_default_storage_path,
+                     sizeof(ladybug_default_storage_path),
+                     "storage.lbdb");
+        }
+        else if (dir[len - 1] == '/')
+        {
+            snprintf(ladybug_default_storage_path,
+                     sizeof(ladybug_default_storage_path),
+                     "%sstorage.lbdb", dir);
+        }
+        else
+        {
+            snprintf(ladybug_default_storage_path,
+                     sizeof(ladybug_default_storage_path),
+                     "%s/storage.lbdb", dir);
+        }
+    }
+
     DefineCustomStringVariable(
         "ladybug.pg_connstr",
         "Postgres connection string for ATTACHing the current database "
@@ -564,5 +609,24 @@ _PG_init(void)
         0,
         NULL, NULL, NULL);
 
-    elog(LOG, "pg_ladybug: loaded (Cypher via embedded Ladybug engine + native SPI)");
+    DefineCustomStringVariable(
+        "ladybug.storage_path",
+        "Filesystem path for the Ladybug storage database. "
+        "Defaults to <DataDir>/storage.lbdb, which gives each cluster "
+        "its own persistent Ladybug catalog under the cluster's data "
+        "directory. The Ladybug engine uses this path instead of the "
+        "in-memory default. If initialization at this path fails, the "
+        "extension falls back to in-memory mode and emits a WARNING.",
+        "Set to an empty string to disable persistent storage (in-memory mode). "
+        "The path is read once per backend on the first call to a function "
+        "that needs the Ladybug engine; changes after that point do not "
+        "affect the already-initialized bridge.",
+        &ladybug_storage_path,
+        ladybug_default_storage_path,
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    elog(LOG, "pg_ladybug: loaded (Cypher via embedded Ladybug engine + native SPI), default storage='%s'",
+         ladybug_default_storage_path);
 }

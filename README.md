@@ -180,6 +180,7 @@ pg_ladybug + pg_client, and run the full test suite.
 | GUC | Default | Description |
 |---|---|---|
 | `ladybug.pg_connstr` | `""` | Connection string used to ATTACH this Postgres to Ladybug's catalog via pg_client |
+| `ladybug.storage_path` | `<DataDir>/storage.lbdb` | Filesystem path for the persistent Ladybug storage. The Ladybug engine uses this path for its catalog (table/schema metadata) instead of the in-memory default. If initialization at this path fails, the extension falls back to in-memory mode and emits a `WARNING`. Set to an empty string to disable persistent storage. The path is read once per backend on the first call to a function that needs the Ladybug engine. |
 
 ## Architecture
 

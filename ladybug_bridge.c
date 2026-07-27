@@ -5,12 +5,16 @@
  * linking against liblbug.so.
  *
  * pg_ladybug links directly to liblbug at build time (no dlopen).  The
- * bridge creates an in-memory Ladybug database + connection, and uses the
- * planner to translate Cypher into a pushed-down SQL string.  That SQL is
- * then executed natively in the PostgreSQL backend via SPI by pg_ladybug.c.
+ * bridge creates a Ladybug database + connection at the path given by
+ * the ladybug.storage_path GUC (defaults to <DataDir>/storage.lbdb), and
+ * uses the planner to translate Cypher into a pushed-down SQL string.
+ * If the GUC is empty or initialization at the configured path fails,
+ * the bridge falls back to an in-memory database and emits a WARNING.
  *
- * Ladybug is used purely as a Cypher->SQL compiler, never for data storage
- * inside the PG backend.
+ * The pushed-down SQL is then executed natively in the PostgreSQL backend
+ * via SPI by pg_ladybug.c.  Ladybug is used purely as a Cypher->SQL
+ * compiler; the storage is used for its catalog (table/schema metadata),
+ * not for graph data inside the PG backend.
  */
 
 #include "postgres.h"
@@ -64,25 +68,83 @@ void   ladybug_bridge_release(LadybugBridge *b);
 /* ================================================================ */
 
 /*
- * ladybug_bridge_acquire -- create an in-memory Ladybug database +
- * connection.  Returns a pointer to the static bridge, or NULL on
- * failure (with *err_msg set).  Cached after first success.
+ * ladybug_bridge_acquire -- create a Ladybug database + connection.
+ * Tries the path given by the ladybug.storage_path GUC first; falls back
+ * to an in-memory database only if the GUC is empty or initialization at
+ * the configured path fails.  Returns a pointer to the static bridge, or
+ * NULL on failure (with *err_msg set).  Cached after first success.
  */
 LadybugBridge *
 ladybug_bridge_acquire(const char **err_msg)
 {
     lbug_system_config cfg;
     lbug_state st;
+    const char *storage_path_guc;
+    char       *storage_path = NULL;
+    bool        storage_attempted = false;
+    char       *storage_err = NULL;
 
     if (bridge.inited)
         return &bridge;
 
     cfg = lbug_default_system_config();
+
+    /*
+     * Try the configured storage path first.  The GUC may be empty (user
+     * explicitly disabled persistent storage) or unset (defaults to
+     * <DataDir>/storage.lbdb, computed by pg_ladybug.c).
+     */
+    storage_path_guc = GetConfigOptionByName("ladybug.storage_path", NULL, false);
+    if (storage_path_guc != NULL && storage_path_guc[0] != '\0')
+    {
+        storage_path = pstrdup(storage_path_guc);
+        storage_attempted = true;
+
+        st = lbug_database_init(storage_path, cfg, &bridge.database);
+        if (st == 0)
+        {
+            /* Storage init succeeded; now create the connection. */
+            st = lbug_connection_init(&bridge.database, &bridge.connection);
+            if (st != 0)
+            {
+                if (err_msg)
+                    *err_msg = psprintf("ladybug: lbug_connection_init failed (state=%d) for storage '%s'",
+                                        (int)st, storage_path);
+                lbug_database_destroy(&bridge.database);
+                pfree(storage_path);
+                memset(&bridge, 0, sizeof(bridge));
+                return NULL;
+            }
+            bridge.inited = true;
+            bridge.attached = false;
+            pfree(storage_path);
+            elog(LOG, "pg_ladybug: ladybug engine initialized with persistent storage");
+            return &bridge;
+        }
+        else
+        {
+            storage_err = psprintf("lbug_database_init failed (state=%d) for storage '%s'",
+                                   (int)st, storage_path);
+            pfree(storage_path);
+            storage_path = NULL;
+            /* Fall through to in-memory fallback below. */
+        }
+    }
+
+    /* Fall back to in-memory mode. */
     st = lbug_database_init(":memory:", cfg, &bridge.database);
     if (st != 0)
     {
         if (err_msg)
-            *err_msg = psprintf("ladybug: lbug_database_init failed (state=%d)", (int)st);
+        {
+            if (storage_attempted && storage_err != NULL)
+                *err_msg = psprintf("ladybug: %s; in-memory fallback also failed (state=%d)",
+                                    storage_err, (int)st);
+            else
+                *err_msg = psprintf("ladybug: lbug_database_init failed (state=%d) for :memory:",
+                                    (int)st);
+        }
+        if (storage_err) pfree(storage_err);
         memset(&bridge, 0, sizeof(bridge));
         return NULL;
     }
@@ -91,14 +153,36 @@ ladybug_bridge_acquire(const char **err_msg)
     if (st != 0)
     {
         if (err_msg)
-            *err_msg = psprintf("ladybug: lbug_connection_init failed (state=%d)", (int)st);
+        {
+            if (storage_attempted && storage_err != NULL)
+                *err_msg = psprintf("ladybug: %s; in-memory connection init also failed (state=%d)",
+                                    storage_err, (int)st);
+            else
+                *err_msg = psprintf("ladybug: lbug_connection_init failed (state=%d) for :memory:",
+                                    (int)st);
+        }
         lbug_database_destroy(&bridge.database);
+        if (storage_err) pfree(storage_err);
         memset(&bridge, 0, sizeof(bridge));
         return NULL;
     }
 
     bridge.inited = true;
     bridge.attached = false;
+
+    if (storage_attempted && storage_err != NULL)
+    {
+        ereport(WARNING,
+                (errmsg("pg_ladybug: failed to initialize ladybug storage, "
+                        "falling back to in-memory mode"),
+                 errdetail("%s", storage_err)));
+        pfree(storage_err);
+    }
+    else
+    {
+        elog(LOG, "pg_ladybug: ladybug engine using in-memory storage "
+                  "(persistent storage disabled or not configured)");
+    }
     return &bridge;
 }
 

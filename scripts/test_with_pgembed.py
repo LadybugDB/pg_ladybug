@@ -142,6 +142,15 @@ def main() -> int:
                      env, check=lambda o, e: "Person" in o)
 
             # ================================================================
+            # Test 4b: ladybug.storage_path GUC default
+            # The default is <DataDir>/storage.lbdb and must end in 'storage.lbdb'.
+            # Use LOAD + SHOW because SHOW alone does not auto-load the extension.
+            # ================================================================
+            run_test("GUC: ladybug.storage_path default",
+                     "LOAD 'pg_ladybug'; SHOW ladybug.storage_path",
+                     env, check=lambda o, e: "storage.lbdb" in o)
+
+            # ================================================================
             # Tests 5-6: Bridge initialization (requires ATTACH via pg_client)
             # ================================================================
             # EXPLAIN RETURN 1 - validates bridge loads liblbug,
