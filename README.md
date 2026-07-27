@@ -12,39 +12,79 @@ tables — with native Postgres execution under the hood.
    (`ladybug.register_node`, `ladybug.register_edge`), or use the `node_*`/`rel_*`
    naming convention.
 2. You write a `MATCH` query in Cypher.
-3. `pg_ladybug` hands it to the embedded Ladybug planner via `dlopen("liblbug.so")`.
-   Ladybug's `ForeignJoinPushDownOptimizer` detects that all tables are backed by
-   the *same* Postgres database and rewrites the entire pattern into a **single SQL
-   JOIN query**.
+3. `pg_ladybug` hands it to the embedded Ladybug planner. Ladybug's planner
+   detects that all tables are backed by the *same* Postgres database and
+   rewrites the entire pattern into a **single SQL JOIN query**.
 4. `pg_ladybug` extracts that SQL from the EXPLAIN plan and runs it **natively via
    SPI** against your local Postgres tables.
 5. Results stream back through a standard `SETOF record` SRF.
 
-No second query engine runs in your Postgres backend. The only "foreign" engine is
-`liblbug`, loaded *out-of-band* and used purely as a Cypher → SQL compiler.
+No second query engine runs in your Postgres backend. `liblbug` is linked at
+build time and used purely as a Cypher → SQL compiler.
 
 ## Requirements
 
-- **PostgreSQL 18** (other versions may work; tested on 18)
+- **PostgreSQL 17+** (tested on 17 and 18)
 - **pg_config** (postgresql-server-dev package)
-- **`liblbug.so`** at runtime (the Ladybug engine shared library; see Installation)
+- **`liblbug.so` v0.19.0+** (Ladybug engine shared library; see Installation)
+- **`libpg_client.lbug_extension`** (pg_client extension for ATTACH; see Installation)
 - **OpenSSL** (liblbug requires `libssl`/`libcrypto`)
+
+## Installation
+
+### 1. Download liblbug and pg_client
+
+You need **liblbug v0.19.0 or later** and the **pg_client extension**.
+
+```bash
+# Download liblbug v0.19.0 (shared library)
+# Set LBUG_VERSION or use a nightly build RUN_ID
+export LBUG_PRECOMPILED_RUN_ID=<run_id>
+export LBUG_TARGET_DIR=./lib
+export LBUG_LIB_KIND=shared
+bash scripts/download-liblbug.sh
+
+# Download pg_client extension (nightly build from LadybugDB/extensions)
+# Place libpg_client.lbug_extension next to liblbug.so
+cp /path/to/libpg_client.lbug_extension lib/
+```
+
+The `lib/` directory should contain:
+```
+lib/
+├── liblbug.so -> liblbug.so.0
+├── liblbug.so.0 -> liblbug.so.0.19.0.*
+├── liblbug.so.0.19.0.*
+└── libpg_client.lbug_extension
+```
+
+### 2. Build and install the extension
+
+```bash
+make
+sudo make install
+```
+
+### 3. Start a test database
+
+```bash
+bash scripts/setup-test-db.sh
+```
+
+Or manually:
+
+```sql
+CREATE EXTENSION pg_ladybug;
+```
 
 ## Quick start
 
 ```bash
-# Build and install the extension
-make
-sudo make install
+# Run the full test suite (uses pgembed — no pre-installed PG needed)
+bash scripts/test.sh
 
-# Start a test database
-createdb -p 5433 ladybug_test
-psql -p 5433 -d ladybug_test -c "CREATE EXTENSION pg_ladybug"
-
-# Or use the setup script
+# Or use an existing PG cluster
 bash scripts/setup-test-db.sh
-
-# Run the tests
 bash scripts/test.sh
 ```
 
@@ -54,14 +94,10 @@ bash scripts/test.sh
 -- Connect to the test database
 \c ladybug_test
 
--- Set liblbug path (adjust if liblbug is in a non-standard location)
-SET ladybug.lib_path = 'liblbug.so';
-
--- Set connection string for the Ladybug ATTACH
+-- Set connection string for the Ladybug ATTACH (via pg_client)
 SET ladybug.pg_connstr = 'host=/var/run/postgresql port=5433 dbname=ladybug_test user=postgres';
 
 -- --- Simple node MATCH ---
--- Uses the node_person table (auto-detected by the postgres extension ATTACH)
 SELECT * FROM ladybug.cypher(
   'MATCH (n:node_person) RETURN n.name, n.age ORDER BY n.age'
 ) AS t(name text, age int);
@@ -74,58 +110,57 @@ SELECT * FROM ladybug.cypher(
 --  Alice |  30
 --  Carol |  35
 
--- --- Node MATCH with WHERE ---
+-- --- Node MATCH with ORDER BY ---
 SELECT * FROM ladybug.cypher(
-  'MATCH (n:node_person) WHERE n.age > 28 RETURN n.name, n.age ORDER BY n.age'
+  'MATCH (n:node_person) RETURN n.name, n.age ORDER BY n.age'
 ) AS t(name text, age int);
-
--- Output:
---  name  | age
--- -------+-----
---  Alice |  30
---  Carol |  35
 
 -- --- See the pushed SQL ---
 SELECT ladybug.pushed_sql(
-  'MATCH (n:node_person) WHERE n.age > 28 RETURN n.name, n.age ORDER BY n.age'
+  'MATCH (n:node_person) RETURN n.name, n.age ORDER BY n.age'
 );
--- Returns: SELECT * FROM node_person WHERE age > 28 ORDER BY age
+-- Returns: SELECT * FROM node_person ORDER BY age
 
--- --- Relationship pattern (requires rel_* auto-detection in Ladybug extension) ---
--- When the Ladybug postgres extension has been modified to detect rel_* tables
--- as relationship tables, this will work:
+-- --- Relationship pattern (requires rel_* tables with FK constraints) ---
 SELECT * FROM ladybug.cypher(
   'MATCH (a:node_person)-[r:rel_knows]->(b:node_person) RETURN a.name, b.name, r.since'
 ) AS t(a_name text, b_name text, since int);
 ```
 
+**Note on labels vs table names:** The pg_client extension registers tables
+using their raw names. Use `node_person` (the table name) as the label
+in Cypher queries. Label→table mapping via `ladybug.register_node()` is
+used by the SQL extraction layer.
+
 ## Naming convention
 
-Tables with the following prefixes are automatically recognized:
+Tables with the following prefixes are automatically recognized by the
+pg_client extension:
 
-| Prefix   | Cypher role       | Example           |
-|----------|-------------------|-------------------|
-| `node_`  | Node label        | `node_person`     |
-| `rel_`   | Relationship      | `rel_knows`       |
+| Prefix | Cypher role  | Example       |
+|--------|--------------|---------------|
+| `node_`| Node label   | `node_person` |
+| `rel_` | Relationship | `rel_knows`   |
 
 For `rel_*` tables, the source and destination node tables are determined by
 foreign key constraints on `src_id` and `dst_id` columns.
 
-You can also register tables manually without the naming convention using
-`ladybug.register_node()` and `ladybug.register_edge()`.
+You can also register tables manually using `ladybug.register_node()` and
+`ladybug.register_edge()`.
 
 ## Test scripts
 
 ```bash
-# Set up the test database with sample data
-bash scripts/setup-test-db.sh
-
-# Run the test suite
+# Run the test suite (uses pgembed — no pre-installed PG needed)
 bash scripts/test.sh
 
-# Options
-bash scripts/test.sh -p 5433 -d ladybug_test -v
+# With verbose output
+bash scripts/test.sh -v
 ```
+
+The test suite uses [pgembed](https://pypi.org/project/pgembed/) to start a
+temporary PostgreSQL instance, build the extension against it, install
+pg_ladybug + pg_client, and run the full test suite.
 
 ## SQL reference
 
@@ -144,8 +179,7 @@ bash scripts/test.sh -p 5433 -d ladybug_test -v
 
 | GUC | Default | Description |
 |---|---|---|
-| `ladybug.lib_path` | `liblbug.so` | Path to the Ladybug shared library (dlopen'd at runtime) |
-| `ladybug.pg_connstr` | `""` | Connection string used to ATTACH this Postgres to Ladybug's catalog |
+| `ladybug.pg_connstr` | `""` | Connection string used to ATTACH this Postgres to Ladybug's catalog via pg_client |
 
 ## Architecture
 
@@ -156,9 +190,11 @@ bash scripts/test.sh -p 5433 -d ladybug_test -v
 │  Cypher query → ladybug.cypher()             │
 │       │                                      │
 │       ▼                                      │
-│  Ladybug planner (liblbug via dlopen)        │
+│  Ladybug planner (liblbug, compile-time      │
+│  linked via -llbug)                          │
 │    - Parse Cypher                            │
-│    - Optimize (ForeignJoinPushDown)          │
+│    - Discover tables via pg_client           │
+│      (libpq → information_schema)            │
 │    - Produce EXPLAIN plan                    │
 │       │                                      │
 │       ▼                                      │
@@ -173,6 +209,22 @@ bash scripts/test.sh -p 5433 -d ladybug_test -v
 │    - Return rows via SRF                     │
 │                                              │
 └─────────────────────────────────────────────┘
+```
+
+The bridge uses the `pg_client` Ladybug extension (loaded from
+`libpg_client.lbug_extension`) to ATTACH the local PostgreSQL database.
+pg_client queries `information_schema.tables` and `information_schema.columns`
+via libpq, making it compatible with all PostgreSQL versions.
+
+## Updating liblbug
+
+```bash
+# Download a specific nightly build
+export LBUG_PRECOMPILED_RUN_ID=<run_id>
+bash scripts/download-liblbug.sh
+
+# Or download the latest release
+bash scripts/download-liblbug.sh
 ```
 
 ## License
