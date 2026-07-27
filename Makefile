@@ -1,12 +1,12 @@
 # pg_ladybug Makefile — PGXS, plain C
-# Does NOT link liblbug at build time; it is dlopen()'d at runtime.
+# Links to liblbug at build time (compile-time linking).
 
 MODULE_big = pg_ladybug
 EXTENSION = pg_ladybug
 DATA = pg_ladybug--1.0.sql
 OBJS = $(WIN32RES) pg_ladybug.o ladybug_bridge.o
 PG_CPPFLAGS = -I.
-SHLIB_LINK = -ldl
+SHLIB_LINK = -L$(CURDIR)/lib -llbug -Wl,-rpath,$(CURDIR)/lib
 PG_CONFIG ?= pg_config
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)

@@ -1,11 +1,4 @@
-pg_ladybug.o
-ladybug_bridge.o
-pg_ladybug.so
-*.sqlite
-*.duckdb
-*.lbug
-.cache
 lib/
-.lbug/
-test_results/
-._*\n.github/._*
+*.o
+*.so
+*.bc

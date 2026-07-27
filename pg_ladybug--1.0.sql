@@ -1,6 +1,5 @@
 -- pg_ladybug: Cypher query support through the embedded Ladybug engine.
--- Ladybug is dlopen()'d at runtime (set ladybug.lib_path); DuckDB is NOT
--- required inside the PostgreSQL backend.  The pushed-down SQL produced by
+-- Ladybug is linked at build time (-llbug); the pushed-down SQL produced by
 -- Ladybug's planner is executed natively by PostgreSQL via SPI.
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
@@ -73,8 +72,7 @@ $$;
 -- ladybug.cypher(cypher_text TEXT) -> SETOF record
 -- Run a Cypher query: Ladybug's planner produces a pushed-down SQL string
 -- which is executed natively by PostgreSQL via SPI.
--- Requires: ladybug.lib_path (GUC) pointing to liblbug, and
---           ladybug.pg_connstr (GUC) for the current Postgres.
+-- Requires: ladybug.pg_connstr (GUC) for the current Postgres.
 -- -----------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION ladybug.cypher(cypher_text TEXT)
 RETURNS SETOF RECORD

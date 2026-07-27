@@ -6,7 +6,7 @@
  *
  * Architecture:
  *   - ladybug_cypher(text)   -> SETOF record
- *       1. dlopen liblbug (runtime; ladybug.lib_path GUC)
+ *       1. Create in-memory Ladybug database + connection (compile-time linked)
  *       2. ATTACH the current Postgres as a foreign catalog (ladybug.pg_connstr)
  *       3. EXPLAIN the Cypher in Ladybug
  *       4. Extract the pushed-down SQL from the plan text
@@ -19,9 +19,12 @@
  *   - ladybug_pushed_sql(text) -> text
  *       Return the extracted pushed-down SQL string.
  *
- * No DuckDB runs inside the PostgreSQL backend.  Ladybug is used purely
- * as a Cypher -> SQL compiler; the pushed-down SQL is executed natively
- * by PostgreSQL itself.
+ * Ladybug is used purely as a Cypher -> SQL compiler; the pushed-down SQL
+ * is executed natively by PostgreSQL itself.
+ *
+ * Build-time linking: pg_ladybug links directly to liblbug.so (-llbug)
+ * rather than using dlopen().  This is best practice for PG extensions
+ * and ensures the library is loaded by the PG backend's
  */
 
 #include "postgres.h"
@@ -60,7 +63,6 @@ extern void   ladybug_bridge_release(LadybugBridge *b);
 /* ------------------------------------------------------------------ */
 /* GUCs                                                               */
 /* ------------------------------------------------------------------ */
-static char *ladybug_lib_path  = "liblbug.so";
 static char *ladybug_pg_connstr = "";
 
 /* ------------------------------------------------------------------ */
@@ -197,11 +199,11 @@ ladybug_cypher(PG_FUNCTION_ARGS)
             MemoryContextSwitchTo(oldcontext);
             if (err_msg)
                 ereport(ERROR,
-                        (errmsg("ladybug: cannot load Ladybug engine"),
+                        (errmsg("ladybug: cannot initialize Ladybug engine"),
                          errdetail("%s", err_msg)));
             else
                 ereport(ERROR,
-                        (errmsg("ladybug: cannot load Ladybug engine")));
+                        (errmsg("ladybug: cannot initialize Ladybug engine")));
         }
 
         /* ATTACH local Postgres (idempotent) */
@@ -461,11 +463,11 @@ ladybug_explain(PG_FUNCTION_ARGS)
     {
         if (err_msg)
             ereport(ERROR,
-                    (errmsg("ladybug: cannot load Ladybug engine"),
+                    (errmsg("ladybug: cannot initialize Ladybug engine"),
                      errdetail("%s", err_msg)));
         else
             ereport(ERROR,
-                    (errmsg("ladybug: cannot load Ladybug engine")));
+                    (errmsg("ladybug: cannot initialize Ladybug engine")));
     }
 
     /* Ensure ATTACH has happened so the planner can resolve tables */
@@ -512,11 +514,11 @@ ladybug_pushed_sql(PG_FUNCTION_ARGS)
     {
         if (err_msg)
             ereport(ERROR,
-                    (errmsg("ladybug: cannot load Ladybug engine"),
+                    (errmsg("ladybug: cannot initialize Ladybug engine"),
                      errdetail("%s", err_msg)));
         else
             ereport(ERROR,
-                    (errmsg("ladybug: cannot load Ladybug engine")));
+                    (errmsg("ladybug: cannot initialize Ladybug engine")));
     }
 
     /* Ensure ATTACH has happened so the planner can resolve tables */
@@ -550,17 +552,6 @@ ladybug_pushed_sql(PG_FUNCTION_ARGS)
 void
 _PG_init(void)
 {
-    DefineCustomStringVariable(
-        "ladybug.lib_path",
-        "Path to the Ladybug engine shared library (liblbug.so/liblbug.dylib).",
-        "If set to just a bare name, dlopen will search the standard "
-        "library search paths.",
-        &ladybug_lib_path,
-        "liblbug.so",
-        PGC_USERSET,
-        0,
-        NULL, NULL, NULL);
-
     DefineCustomStringVariable(
         "ladybug.pg_connstr",
         "Postgres connection string for ATTACHing the current database "
