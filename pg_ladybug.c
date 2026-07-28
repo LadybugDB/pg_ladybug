@@ -101,7 +101,7 @@ typedef struct LadybugSRFContext
 /* Returns the number of rows, or -1 on error.                          */
 /* ------------------------------------------------------------------ */
 static int
-spi_execute_and_capture(const char *sql, TupleDesc expected_tupdesc,
+spi_execute_and_capture(const char *sql,
                         SPITupleTable **out_tuptable, int *out_ncols)
 {
     int ret;
@@ -111,17 +111,15 @@ spi_execute_and_capture(const char *sql, TupleDesc expected_tupdesc,
         ereport(ERROR,
                 (errmsg("ladybug: SPI_connect failed")));
 
-    ret = SPI_execute(sql, true /* read_only */, 0 /* no limit */);
-    if (ret != SPI_OK_SELECT &&
-        ret != SPI_OK_INSERT_RETURNING &&
-        ret != SPI_OK_UPDATE_RETURNING &&
-        ret != SPI_OK_DELETE_RETURNING)
+    /* read_only=true because we never execute modifying queries */
+    ret = SPI_execute(sql, true, 0);
+    if (ret != SPI_OK_SELECT)
     {
         SPI_finish();
         ereport(ERROR,
-                (errmsg("ladybug: SPI_execute failed for pushed-down SQL"),
+                (errmsg("ladybug: SPI_execute failed"),
                  errdetail("SPI status: %d", ret),
-                 errhint("The pushed-down SQL: %s", sql)));
+                 errhint("The SQL: %s", sql)));
     }
 
     *out_tuptable = SPI_tuptable;
@@ -246,7 +244,7 @@ ladybug_cypher(PG_FUNCTION_ARGS)
             pfree(cypher_cstr);
 
             /* Execute SQL via SPI and copy all row data into multi-call memory context */
-            nrows = spi_execute_and_capture(sql, expected_tupdesc, &tuptable, &ncols);
+            nrows = spi_execute_and_capture(sql, &tuptable, &ncols);
             pfree(sql);
 
             srfctx->nrows = nrows;
@@ -532,7 +530,7 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
         query_text = PG_GETARG_TEXT_PP(0);
         query_cstr = text_to_cstring(query_text);
 
-        nrows = spi_execute_and_capture(query_cstr, expected_tupdesc, &tuptable, &ncols);
+        nrows = spi_execute_and_capture(query_cstr, &tuptable, &ncols);
         pfree(query_cstr);
 
         srfctx->nrows = nrows;
@@ -833,25 +831,35 @@ _PG_init(void)
     {
         const char *dir = DataDir;
         size_t      len = (dir != NULL) ? strlen(dir) : 0;
+        int         printed;
 
         if (len == 0)
         {
             /* No DataDir available; fall back to a relative path. */
-            snprintf(ladybug_default_storage_path,
-                     sizeof(ladybug_default_storage_path),
-                     "storage.lbdb");
+            printed = snprintf(ladybug_default_storage_path,
+                               sizeof(ladybug_default_storage_path),
+                               "storage.lbdb");
         }
         else if (dir[len - 1] == '/')
         {
-            snprintf(ladybug_default_storage_path,
-                     sizeof(ladybug_default_storage_path),
-                     "%sstorage.lbdb", dir);
+            printed = snprintf(ladybug_default_storage_path,
+                               sizeof(ladybug_default_storage_path),
+                               "%sstorage.lbdb", dir);
         }
         else
         {
-            snprintf(ladybug_default_storage_path,
-                     sizeof(ladybug_default_storage_path),
-                     "%s/storage.lbdb", dir);
+            printed = snprintf(ladybug_default_storage_path,
+                               sizeof(ladybug_default_storage_path),
+                               "%s/storage.lbdb", dir);
+        }
+
+        if (printed < 0 || (size_t)printed >= sizeof(ladybug_default_storage_path))
+        {
+            ereport(WARNING,
+                    (errmsg("ladybug: default storage path too long, using in-memory storage"),
+                     errdetail("DataDir length %zu exceeds buffer size %zu", len,
+                               sizeof(ladybug_default_storage_path))));
+            ladybug_default_storage_path[0] = '\0';
         }
     }
 
