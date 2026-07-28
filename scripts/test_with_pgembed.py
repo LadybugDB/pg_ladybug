@@ -110,6 +110,21 @@ def main() -> int:
                     cur.execute("SELECT * FROM ladybug._graph_meta")
                     print("Graph meta:", cur.fetchall())
 
+                    # Create fkrel_knows table for MATCH-with-relationship tests
+                    cur.execute("""
+                        CREATE TABLE fkrel_knows (
+                            id INT PRIMARY KEY,
+                            src_id INT NOT NULL,
+                            dst_id INT NOT NULL,
+                            since TEXT
+                        )
+                    """)
+                    cur.execute("ALTER TABLE fkrel_knows ADD CONSTRAINT fk_src FOREIGN KEY (src_id) REFERENCES node_person(id)")
+                    cur.execute("ALTER TABLE fkrel_knows ADD CONSTRAINT fk_dst FOREIGN KEY (dst_id) REFERENCES node_person(id)")
+                    cur.execute("INSERT INTO fkrel_knows VALUES "
+                                "(1, 1, 2, '2020-01-15'), (2, 1, 3, '2021-03-20'), "
+                                "(3, 2, 4, '2022-06-10'), (4, 3, 4, '2023-08-05')")
+
             # Build environment for psql
             from urllib.parse import urlparse, parse_qs
             parsed = urlparse(test_uri)
@@ -258,8 +273,27 @@ def main() -> int:
                      env, check=lambda o, e: ("Alice" in o and "Carol" in o
                                               and "Bob" not in o and "Dave" not in o))
 
+            # ================================================================
+            # Test: MATCH with relationship (fkrel table join) - similar to
+            # pg_client test 06b. The planner translates the pattern
+            # (a)-[k]->(b) into a SQL JOIN that is executed via SPI.
+            # ================================================================
+            run_test("Cypher: MATCH with fkrel relationship (count)",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT count(*)::int AS cnt FROM ladybug.cypher("
+                     "'MATCH (a:node_person)-[k:fkrel_knows]->(b:node_person) RETURN count(*)'"
+                     ") AS t(cnt int)",
+                     env, check=lambda o, e: "4" in o)
+
+            run_test("Cypher: MATCH with fkrel relationship (projection)",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher("
+                     "'MATCH (a:node_person)-[k:fkrel_knows]->(b:node_person) RETURN a.name, b.name, k.since'"
+                     ") AS t(a_name text, b_name text, since text) ORDER BY a_name",
+                     env, check=lambda o, e: ("Alice" in o and "Bob" in o and "2020-01-15" in o))
+
             print(f"\n=== {tests_passed}/{tests_total} tests passed ===")
-            # All 15 tests are required.
+            # All 17 tests are required.
             if tests_passed >= tests_total:
                 print("All essential tests PASSED - compile-time linking works!")
                 return 0

@@ -256,14 +256,27 @@ ladybug_cypher(PG_FUNCTION_ARGS)
             if (nrows > 0 && tuptable != NULL)
             {
                 TupleDesc spi_tupdesc = tuptable->tupdesc;
-                /* Build column name mapping from SPI result columns to expected */
-                int *col_map = (int *) palloc(ncols * sizeof(int));
-                for (int a = 0; a < ncols; a++)
+                int natts = expected_tupdesc->natts;
+                /* Build column name mapping from SPI result columns to expected.
+                 * Strategy:
+                 * 1. Try exact name match first (column aliases match exactly).
+                 * 2. If no exact match, try suffix match: for SPI columns like
+                 *    "k_since", strip the table-prefix part (before '_') and match
+                 *    the remainder against the expected name. This handles cases
+                 *    where the SQL aliases are prefixed (e.g. "k_since") but the
+                 *    expected column name is the bare property name (e.g. "since").
+                 * 3. If still no match, try matching just the bare property name
+                 *    from the SPI column (everything after the first '_' or '.').
+                 */
+                int *col_map = (int *) palloc(natts * sizeof(int));
+                for (int a = 0; a < natts; a++)
                 {
                     const char *exp_name;
 
                     col_map[a] = -1;
                     exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
+
+                    /* Pass 1: exact match */
                     for (int b = 0; b < ncols; b++)
                     {
                         const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
@@ -273,8 +286,45 @@ ladybug_cypher(PG_FUNCTION_ARGS)
                             break;
                         }
                     }
+
+                    /* Pass 2: suffix match - spi_name ends with '_' + exp_name */
                     if (col_map[a] < 0)
-                        col_map[a] = a; /* fallback to positional */
+                    {
+                        size_t exp_len = strlen(exp_name);
+                        for (int b = 0; b < ncols; b++)
+                        {
+                            const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
+                            size_t spi_len = strlen(spi_name);
+                            if (spi_len > exp_len + 1 &&
+                                spi_name[spi_len - exp_len - 1] == '_' &&
+                                strcmp(spi_name + spi_len - exp_len, exp_name) == 0)
+                            {
+                                col_map[a] = b;
+                                break;
+                            }
+                        }
+                    }
+
+                    /* Pass 3: match bare property name from SPI column */
+                    if (col_map[a] < 0)
+                    {
+                        for (int b = 0; b < ncols; b++)
+                        {
+                            const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
+                            const char *underscore = strchr(spi_name, '_');
+                            const char *dot = strchr(spi_name, '.');
+                            const char *sep = (underscore && dot) ?
+                                (underscore < dot ? underscore : dot) :
+                                (underscore ? underscore : dot);
+                            if (sep != NULL && strcmp(sep + 1, exp_name) == 0)
+                            {
+                                col_map[a] = b;
+                                break;
+                            }
+                        }
+                    }
+
+                    /* If still no match, leave col_map[a] = -1 (will yield NULL) */
                 }
 
                 for (int i = 0; i < nrows && i < MAX_COLS; i++)
@@ -285,17 +335,20 @@ ladybug_cypher(PG_FUNCTION_ARGS)
                     HeapTuple ht;
 
                     spi_tup = tuptable->vals[i];
-                    vals = (Datum *) palloc(ncols * sizeof(Datum));
-                    nls  = (bool  *) palloc(ncols * sizeof(bool));
+                    vals = (Datum *) palloc(natts * sizeof(Datum));
+                    nls  = (bool  *) palloc(natts * sizeof(bool));
 
-                    for (int a = 0; a < ncols; a++)
+                    for (int a = 0; a < natts; a++)
                     {
                         int spi_idx;
                         bool isnull;
 
                         spi_idx = col_map[a];
                         isnull = false;
-                        vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                        if (spi_idx >= 0 && spi_idx < ncols)
+                            vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                        else
+                            isnull = true;
                         nls[a] = isnull;
                     }
 
@@ -460,14 +513,27 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
         if (nrows > 0 && tuptable != NULL)
         {
             TupleDesc spi_tupdesc = tuptable->tupdesc;
-            /* Build column name mapping from SPI result columns to expected */
-            int *col_map = (int *) palloc(ncols * sizeof(int));
-            for (int a = 0; a < ncols; a++)
+            int natts = expected_tupdesc->natts;
+            /* Build column name mapping from SPI result columns to expected.
+             * Strategy:
+             * 1. Try exact name match first (column aliases match exactly).
+             * 2. If no exact match, try suffix match: for SPI columns like
+             *    "k_since", strip the table-prefix part (before '_') and match
+             *    the remainder against the expected name. This handles cases
+             *    where the SQL aliases are prefixed (e.g. "k_since") but the
+             *    expected column name is the bare property name (e.g. "since").
+             * 3. If still no match, try matching just the bare property name
+             *    from the SPI column (everything after the first '_' or '.').
+             */
+            int *col_map = (int *) palloc(natts * sizeof(int));
+            for (int a = 0; a < natts; a++)
             {
                 const char *exp_name;
 
                 col_map[a] = -1;
                 exp_name = NameStr(TupleDescAttr(expected_tupdesc, a)->attname);
+
+                /* Pass 1: exact match */
                 for (int b = 0; b < ncols; b++)
                 {
                     const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
@@ -477,8 +543,45 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
                         break;
                     }
                 }
+
+                /* Pass 2: suffix match - spi_name ends with '_' + exp_name */
                 if (col_map[a] < 0)
-                    col_map[a] = a;
+                {
+                    size_t exp_len = strlen(exp_name);
+                    for (int b = 0; b < ncols; b++)
+                    {
+                        const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
+                        size_t spi_len = strlen(spi_name);
+                        if (spi_len > exp_len + 1 &&
+                            spi_name[spi_len - exp_len - 1] == '_' &&
+                            strcmp(spi_name + spi_len - exp_len, exp_name) == 0)
+                        {
+                            col_map[a] = b;
+                            break;
+                        }
+                    }
+                }
+
+                /* Pass 3: match bare property name from SPI column */
+                if (col_map[a] < 0)
+                {
+                    for (int b = 0; b < ncols; b++)
+                    {
+                        const char *spi_name = NameStr(TupleDescAttr(spi_tupdesc, b)->attname);
+                        const char *underscore = strchr(spi_name, '_');
+                        const char *dot = strchr(spi_name, '.');
+                        const char *sep = (underscore && dot) ?
+                            (underscore < dot ? underscore : dot) :
+                            (underscore ? underscore : dot);
+                        if (sep != NULL && strcmp(sep + 1, exp_name) == 0)
+                        {
+                            col_map[a] = b;
+                            break;
+                        }
+                    }
+                }
+
+                /* If still no match, leave col_map[a] = -1 (will yield NULL) */
             }
 
             for (int i = 0; i < nrows && i < MAX_COLS; i++)
@@ -489,17 +592,20 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
                 HeapTuple ht;
 
                 spi_tup = tuptable->vals[i];
-                vals = (Datum *) palloc(ncols * sizeof(Datum));
-                nls  = (bool  *) palloc(ncols * sizeof(bool));
+                vals = (Datum *) palloc(natts * sizeof(Datum));
+                nls  = (bool  *) palloc(natts * sizeof(bool));
 
-                for (int a = 0; a < ncols; a++)
+                for (int a = 0; a < natts; a++)
                 {
                     int spi_idx;
                     bool isnull;
 
                     spi_idx = col_map[a];
                     isnull = false;
-                    vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                    if (spi_idx >= 0 && spi_idx < ncols)
+                        vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                    else
+                        isnull = true;
                     nls[a] = isnull;
                 }
 
