@@ -275,15 +275,33 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
         return false;
     }
     if (b->attached)
+    {
+        /*
+         * Already attached.  If the caller passes a different connstr,
+         * reject the change (see issue 5).  The bridge is bound to the
+         * original connstr for the lifetime of the backend.
+         */
+        if (pg_connstr && b->attached_connstr &&
+            strcmp(pg_connstr, b->attached_connstr) != 0)
+        {
+            if (err_msg)
+                *err_msg = psprintf(
+                    "ladybug: cannot change ladybug.pg_connstr from "
+                    "\"%s\" to \"%s\" within the same session; "
+                    "ATTACH is fixed for the lifetime of the backend",
+                    b->attached_connstr, pg_connstr);
+            return false;
+        }
         return true;
+    }
 
     e = NULL;
 
     /*
-     * LOAD the pg_client extension.  Since PG_CLIENT is not in Ladybug's
-     * official extension list, we must pass the full path to the .lbug_extension
-     * file.  We find it relative to liblbug.so (which is linked into pg_ladybug).
+     * LOAD the pg_client extension, unless we already did it in this
+     * bridge session (tracked by extension_loaded).
      */
+    if (!b->extension_loaded)
     {
         Dl_info dl_info;
         char *ext_path = NULL;
@@ -311,7 +329,13 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
 
             if (!ladybug_bridge_direct_sql(b, load_sql.data, &e))
             {
-                if (e == NULL || strstr(e, "already") == NULL)
+                /*
+                 * If the extension was already loaded (the persistent
+                 * database may have it from a previous session), treat
+                 * the "already exists" error as non-fatal but still
+                 * check for a more specific error.
+                 */
+                if (e == NULL || strstr(e, "already exists") == NULL)
                 {
                     if (err_msg) *err_msg = e;
                     else if (e) pfree((char *)e);
@@ -329,9 +353,12 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
             if (err_msg) *err_msg = pstrdup("ladybug: cannot locate liblbug.so path");
             return false;
         }
+
+        b->extension_loaded = true;
     }
 
     /* ATTACH '<connstr>' AS pg (dbtype PG_CLIENT); */
+    if (!b->attached)
     {
         StringInfoData attach_sql;
         initStringInfo(&attach_sql);
@@ -347,7 +374,12 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
 
         if (!ladybug_bridge_direct_sql(b, attach_sql.data, &e))
         {
-            if (e == NULL || strstr(e, "already") == NULL)
+            /*
+             * If the ATTACH was already done (persistent storage from a
+             * previous session), treat the "already exists" error as
+             * non-fatal.
+             */
+            if (e == NULL || strstr(e, "already exists") == NULL)
             {
                 if (err_msg) *err_msg = e;
                 else if (e) pfree((char *)e);
@@ -357,9 +389,17 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
             if (e) { pfree((char *)e); e = NULL; }
         }
         pfree(attach_sql.data);
+
+        /*
+         * Save the connstr used for ATTACH in TopMemoryContext so it
+         * persists across transactions for the lifetime of the backend.
+         */
+        if (b->attached_connstr)
+            pfree(b->attached_connstr);
+        b->attached_connstr = MemoryContextStrdup(TopMemoryContext, pg_connstr);
+        b->attached = true;
     }
 
-    b->attached = true;
     return true;
 }
 
