@@ -39,8 +39,10 @@ typedef struct LadybugBridge
 {
     lbug_database      database;       /* in-memory Ladybug DB   */
     lbug_connection    connection;     /* live connection        */
-    bool               attached;       /* ATTACH done this backend */
     bool               inited;         /* database+conn created  */
+    bool               extension_loaded;/* pg_client extension loaded */
+    bool               attached;       /* ATTACH done this backend */
+    char              *attached_connstr;/* connstr used for ATTACH, in TopMemoryContext */
 } LadybugBridge;
 
 /* One bridge per backend (cached after first successful init). */
@@ -108,24 +110,36 @@ ladybug_bridge_acquire(const char **err_msg)
             st = lbug_connection_init(&bridge.database, &bridge.connection);
             if (st != 0)
             {
-                if (err_msg)
-                    *err_msg = psprintf("ladybug: lbug_connection_init failed (state=%d) for storage '%s'",
-                                        (int)st, storage_path);
+                /*
+                 * Connection init failed even though database init succeeded.
+                 * Record the error, clean up, and fall through to the
+                 * in-memory fallback below (consistent with the documented
+                 * fallback-to-in-memory contract).
+                 */
+                if (storage_err == NULL)
+                    storage_err = psprintf("lbug_connection_init failed (state=%d) for storage '%s'",
+                                           (int)st, storage_path);
                 lbug_database_destroy(&bridge.database);
                 pfree(storage_path);
+                storage_path = NULL;
                 memset(&bridge, 0, sizeof(bridge));
-                return NULL;
+                /* Fall through to in-memory fallback below. */
             }
-            bridge.inited = true;
-            bridge.attached = false;
-            pfree(storage_path);
-            elog(LOG, "pg_ladybug: ladybug engine initialized with persistent storage");
-            return &bridge;
+            else
+            {
+                bridge.inited = true;
+                bridge.attached = false;
+                bridge.extension_loaded = false;
+                pfree(storage_path);
+                elog(LOG, "pg_ladybug: ladybug engine initialized with persistent storage");
+                return &bridge;
+            }
         }
         else
         {
-            storage_err = psprintf("lbug_database_init failed (state=%d) for storage '%s'",
-                                   (int)st, storage_path);
+            if (storage_err == NULL)
+                storage_err = psprintf("lbug_database_init failed (state=%d) for storage '%s'",
+                                       (int)st, storage_path);
             pfree(storage_path);
             storage_path = NULL;
             /* Fall through to in-memory fallback below. */
