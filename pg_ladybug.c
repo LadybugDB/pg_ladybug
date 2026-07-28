@@ -860,10 +860,11 @@ _PG_init(void)
         "Postgres connection string for ATTACHing the current database "
         "to the Ladybug engine so its planner can resolve local tables.",
         "E.g. 'host=localhost port=5432 dbname=mydb user=me'. "
-        "Must be set before calling ladybug.cypher() or ladybug.pushed_sql().",
+        "Must be set before calling ladybug.cypher() or ladybug.pushed_sql(). "
+        "Only superusers may set this GUC.",
         &ladybug_pg_connstr,
         "",
-        PGC_USERSET,
+        PGC_SUSET,
         0,
         NULL, NULL, NULL);
 
@@ -881,7 +882,7 @@ _PG_init(void)
         "affect the already-initialized bridge.",
         &ladybug_storage_path,
         ladybug_default_storage_path,
-        PGC_USERSET,
+        PGC_SUSET,
         0,
         NULL, NULL, NULL);
 

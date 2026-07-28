@@ -378,11 +378,18 @@ ladybug_bridge_attach_postgres(LadybugBridge *b, const char *pg_connstr, const c
              * If the ATTACH was already done (persistent storage from a
              * previous session), treat the "already exists" error as
              * non-fatal.
+             *
+             * For genuine failures, use a sanitized message rather than
+             * echoing the raw engine error (which may contain the connstr
+             * including passwords).
              */
             if (e == NULL || strstr(e, "already exists") == NULL)
             {
-                if (err_msg) *err_msg = e;
-                else if (e) pfree((char *)e);
+                if (err_msg)
+                    *err_msg = pstrdup(
+                        "ladybug: ATTACH Postgres failed; check connection "
+                        "settings and server logs for details");
+                if (e) pfree((char *)e);
                 pfree(attach_sql.data);
                 return false;
             }
