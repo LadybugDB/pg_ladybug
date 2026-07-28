@@ -181,6 +181,11 @@ ladybug_cypher(PG_FUNCTION_ARGS)
     LadybugSRFContext  *srfctx;
     TupleDesc           expected_tupdesc;
 
+    /* Defense-in-depth: should not be reached because SQL declares STRICT */
+    if (PG_ARGISNULL(0))
+        ereport(ERROR,
+                (errmsg("ladybug.cypher(): NULL argument is not allowed")));
+
     if (SRF_IS_FIRSTCALL())
     {
         MemoryContext oldcontext;
@@ -472,6 +477,11 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
     text    *query_text;
     char    *query_cstr;
 
+    /* Defense-in-depth: should not be reached because SQL declares STRICT */
+    if (PG_ARGISNULL(0))
+        ereport(ERROR,
+                (errmsg("ladybug.sql_query(): NULL argument is not allowed")));
+
     if (SRF_IS_FIRSTCALL())
     {
         MemoryContext oldcontext;
@@ -648,11 +658,18 @@ PG_FUNCTION_INFO_V1(ladybug_explain);
 Datum
 ladybug_explain(PG_FUNCTION_ARGS)
 {
-    text     *cypher_text = PG_GETARG_TEXT_PP(0);
+    text     *cypher_text;
     char     *cypher_cstr;
     const char *err_msg = NULL;
     char     *plan_text;
     text     *result;
+    LadybugBridge *b;
+
+    /* Defense-in-depth: should not be reached because SQL declares STRICT */
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    cypher_text = PG_GETARG_TEXT_PP(0);
 
     LadybugBridge *b = ladybug_bridge_acquire(&err_msg);
     if (b == NULL)
@@ -699,13 +716,19 @@ PG_FUNCTION_INFO_V1(ladybug_pushed_sql);
 Datum
 ladybug_pushed_sql(PG_FUNCTION_ARGS)
 {
-    text     *cypher_text = PG_GETARG_TEXT_PP(0);
+    text     *cypher_text;
     char     *cypher_cstr;
     const char *err_msg = NULL;
     char     *sql;
     text     *result;
+    LadybugBridge *b;
 
-    LadybugBridge *b = ladybug_bridge_acquire(&err_msg);
+    /* Defense-in-depth: should not be reached because SQL declares STRICT */
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    cypher_text = PG_GETARG_TEXT_PP(0);
+    b = ladybug_bridge_acquire(&err_msg);
     if (b == NULL)
     {
         if (err_msg)
