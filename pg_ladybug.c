@@ -303,6 +303,9 @@ ladybug_cypher(PG_FUNCTION_ARGS)
                                 strcmp(spi_name + spi_len - exp_len, exp_name) == 0)
                             {
                                 col_map[a] = b;
+                                ereport(WARNING,
+                                        (errmsg("ladybug: column \"%s\" matched to \"%s\" by suffix",
+                                                exp_name, spi_name)));
                                 break;
                             }
                         }
@@ -322,6 +325,9 @@ ladybug_cypher(PG_FUNCTION_ARGS)
                             if (sep != NULL && strcmp(sep + 1, exp_name) == 0)
                             {
                                 col_map[a] = b;
+                                ereport(WARNING,
+                                        (errmsg("ladybug: column \"%s\" matched to \"%s\" by bare property name",
+                                                exp_name, spi_name)));
                                 break;
                             }
                         }
@@ -351,7 +357,32 @@ ladybug_cypher(PG_FUNCTION_ARGS)
                         spi_idx = col_map[a];
                         isnull = false;
                         if (spi_idx >= 0 && spi_idx < ncols)
-                            vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                        {
+                            Oid spi_type = TupleDescAttr(spi_tupdesc, spi_idx)->atttypid;
+                            Oid exp_type = TupleDescAttr(expected_tupdesc, a)->atttypid;
+                            if (spi_type == exp_type)
+                            {
+                                vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                            }
+                            else
+                            {
+                                /* Type mismatch: convert through text representation */
+                                char *str = SPI_getvalue(spi_tup, spi_tupdesc, spi_idx + 1);
+                                if (str)
+                                {
+                                    Oid typioparam, typinput;
+                                    int32 typmod;
+                                    FmgrInfo finfo;
+                                    getTypeInputInfo(exp_type, &typinput, &typioparam);
+                                    typmod = TupleDescAttr(expected_tupdesc, a)->atttypmod;
+                                    fmgr_info(typinput, &finfo);
+                                    vals[a] = InputFunctionCall(&finfo, str, typioparam, typmod);
+                                    pfree(str);
+                                }
+                                else
+                                    isnull = true;
+                            }
+                        }
                         else
                             isnull = true;
                         nls[a] = isnull;
@@ -558,6 +589,9 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
                             strcmp(spi_name + spi_len - exp_len, exp_name) == 0)
                         {
                             col_map[a] = b;
+                            ereport(WARNING,
+                                    (errmsg("ladybug: column \"%s\" matched to \"%s\" by suffix",
+                                            exp_name, spi_name)));
                             break;
                         }
                     }
@@ -577,6 +611,9 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
                         if (sep != NULL && strcmp(sep + 1, exp_name) == 0)
                         {
                             col_map[a] = b;
+                            ereport(WARNING,
+                                    (errmsg("ladybug: column \"%s\" matched to \"%s\" by bare property name",
+                                            exp_name, spi_name)));
                             break;
                         }
                     }
@@ -606,7 +643,32 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
                     spi_idx = col_map[a];
                     isnull = false;
                     if (spi_idx >= 0 && spi_idx < ncols)
-                        vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                    {
+                        Oid spi_type = TupleDescAttr(spi_tupdesc, spi_idx)->atttypid;
+                        Oid exp_type = TupleDescAttr(expected_tupdesc, a)->atttypid;
+                        if (spi_type == exp_type)
+                        {
+                            vals[a] = SPI_getbinval(spi_tup, spi_tupdesc, spi_idx + 1, &isnull);
+                        }
+                        else
+                        {
+                            /* Type mismatch: convert through text representation */
+                            char *str = SPI_getvalue(spi_tup, spi_tupdesc, spi_idx + 1);
+                            if (str)
+                            {
+                                Oid typioparam, typinput;
+                                int32 typmod;
+                                FmgrInfo finfo;
+                                getTypeInputInfo(exp_type, &typinput, &typioparam);
+                                typmod = TupleDescAttr(expected_tupdesc, a)->atttypmod;
+                                fmgr_info(typinput, &finfo);
+                                vals[a] = InputFunctionCall(&finfo, str, typioparam, typmod);
+                                pfree(str);
+                            }
+                            else
+                                isnull = true;
+                        }
+                    }
                     else
                         isnull = true;
                     nls[a] = isnull;
