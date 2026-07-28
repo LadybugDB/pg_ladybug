@@ -87,15 +87,13 @@ static char ladybug_default_storage_path[LADYBUG_DEFAULT_STORAGE_PATH_BUFSIZE];
 /* ------------------------------------------------------------------ */
 /* SRF execution context for row streaming                             */
 /* ------------------------------------------------------------------ */
-#define MAX_COLS 64
 typedef struct LadybugSRFContext
 {
     TupleDesc       tupdesc;
     int             natts;
     int             current_row;  /* current row index while iterating */
     int             nrows;        /* total rows */
-    Datum          *values[MAX_COLS]; /* per-row Datum arrays */
-    bool           *nulls[MAX_COLS];  /* per-row null flags */
+    HeapTuple      *rows;         /* dynamically allocated array of HeapTuples */
 } LadybugSRFContext;
 
 /* ------------------------------------------------------------------ */
@@ -332,7 +330,9 @@ ladybug_cypher(PG_FUNCTION_ARGS)
                     /* If still no match, leave col_map[a] = -1 (will yield NULL) */
                 }
 
-                for (int i = 0; i < nrows && i < MAX_COLS; i++)
+                srfctx->rows = (HeapTuple *) palloc(nrows * sizeof(HeapTuple));
+
+                for (int i = 0; i < nrows; i++)
                 {
                     HeapTuple spi_tup;
                     Datum *vals;
@@ -359,9 +359,7 @@ ladybug_cypher(PG_FUNCTION_ARGS)
 
                     /* Build the heap tuple now, while SPI data is still valid */
                     ht = heap_form_tuple(expected_tupdesc, vals, nls);
-                    srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
-                    srfctx->values[i][0] = HeapTupleGetDatum(ht);
-                    srfctx->nulls[i] = NULL;
+                    srfctx->rows[i] = ht;
 
                     pfree(vals);
                     pfree(nls);
@@ -427,20 +425,13 @@ ladybug_cypher(PG_FUNCTION_ARGS)
             funcctx->max_calls = nrows_lbug;
 
             /*
-             * Wrap each returned HeapTuple in a single-element Datum array,
-             * matching the layout produced by the SPI path above so the
-             * SRF per-call code can use a single accessor.
-             *
-             * The HeapTuples are already palloc'd in the multi-call memory
-             * context (we set that context before calling the bridge), so
-             * they survive until the SRF completes.
+             * Take ownership of the HeapTuples returned by the bridge.
+             * They are already palloc'd in the multi-call memory context,
+             * so they survive until the SRF completes.
              */
-            for (int i = 0; i < nrows_lbug && i < MAX_COLS; i++)
-            {
-                srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
-                srfctx->values[i][0] = HeapTupleGetDatum(tuples[i]);
-                srfctx->nulls[i] = NULL;
-            }
+            srfctx->rows = (HeapTuple *) palloc(nrows_lbug * sizeof(HeapTuple));
+            for (int i = 0; i < nrows_lbug; i++)
+                srfctx->rows[i] = tuples[i];
             if (tuples != NULL)
                 pfree(tuples);
         }
@@ -451,10 +442,10 @@ ladybug_cypher(PG_FUNCTION_ARGS)
     funcctx = SRF_PERCALL_SETUP();
     srfctx = (LadybugSRFContext *) funcctx->user_fctx;
 
-    if (srfctx->current_row < srfctx->nrows && srfctx->current_row < MAX_COLS)
+    if (srfctx->current_row < srfctx->nrows)
     {
         int i = srfctx->current_row;
-        Datum result = srfctx->values[i][0];
+        Datum result = HeapTupleGetDatum(srfctx->rows[i]);
         srfctx->current_row++;
         SRF_RETURN_NEXT(funcctx, result);
     }
@@ -594,7 +585,9 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
                 /* If still no match, leave col_map[a] = -1 (will yield NULL) */
             }
 
-            for (int i = 0; i < nrows && i < MAX_COLS; i++)
+            srfctx->rows = (HeapTuple *) palloc(nrows * sizeof(HeapTuple));
+
+            for (int i = 0; i < nrows; i++)
             {
                 HeapTuple spi_tup;
                 Datum *vals;
@@ -621,9 +614,7 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
 
                 /* Build the heap tuple now, while SPI data is still valid */
                 ht = heap_form_tuple(expected_tupdesc, vals, nls);
-                srfctx->values[i] = (Datum *) palloc(sizeof(Datum));
-                srfctx->values[i][0] = HeapTupleGetDatum(ht);
-                srfctx->nulls[i] = NULL;
+                srfctx->rows[i] = ht;
 
                 pfree(vals);
                 pfree(nls);
@@ -638,10 +629,10 @@ ladybug_sql_query(PG_FUNCTION_ARGS)
     funcctx = SRF_PERCALL_SETUP();
     srfctx = (LadybugSRFContext *) funcctx->user_fctx;
 
-    if (srfctx->current_row < srfctx->nrows && srfctx->current_row < MAX_COLS)
+    if (srfctx->current_row < srfctx->nrows)
     {
         int i = srfctx->current_row;
-        Datum result = srfctx->values[i][0];
+        Datum result = HeapTupleGetDatum(srfctx->rows[i]);
         srfctx->current_row++;
         SRF_RETURN_NEXT(funcctx, result);
     }
