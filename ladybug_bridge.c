@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include <string.h>
+#include "utils/memutils.h"
 #include <stdlib.h>
 #include <dlfcn.h>
 
@@ -837,5 +838,7 @@ ladybug_bridge_release(LadybugBridge *b)
     lbug_connection_destroy(&b->connection);
     lbug_database_destroy(&b->database);
 
+    if (bridge.attached_connstr)
+        pfree(bridge.attached_connstr);
     memset(&bridge, 0, sizeof(bridge));
 }

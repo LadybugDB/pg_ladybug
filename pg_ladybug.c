@@ -722,7 +722,7 @@ ladybug_explain(PG_FUNCTION_ARGS)
 
     cypher_text = PG_GETARG_TEXT_PP(0);
 
-    LadybugBridge *b = ladybug_bridge_acquire(&err_msg);
+    b = ladybug_bridge_acquire(&err_msg);
     if (b == NULL)
     {
         if (err_msg)
