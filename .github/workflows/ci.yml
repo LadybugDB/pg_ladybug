@@ -1,72 +1,24 @@
 name: CI
-
-on:
-  workflow_dispatch:
-  pull_request:
-    branches: [ main ]
-  push:
-    branches: [ main ]
-
-permissions:
-  actions: read
-  contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
+on: [push, pull_request]
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
+  test:
     strategy:
       matrix:
-        postgres: [17]
-    name: PostgreSQL ${{ matrix.postgres }}
-
+        pg: [16, 17, 18]
+    name: 🐘 PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    container: pgxn/pgxn-tools
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install PostgreSQL ${{ matrix.postgres }} build dependencies
+      - name: Start PostgreSQL ${{ matrix.pg }}
+        run: pg-start ${{ matrix.pg }}
+      - name: Check out the repo
+        uses: actions/checkout@v4
+      - name: Download liblbug (for Cypher planner)
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            postgresql-${{ matrix.postgres }} \
-            postgresql-server-dev-${{ matrix.postgres }} \
-            build-essential \
-            libssl-dev \
-            curl
-
-      - name: Build extension
-        run: |
-          make PG_CONFIG=/usr/lib/postgresql/${{ matrix.postgres }}/bin/pg_config
-          sudo make PG_CONFIG=/usr/lib/postgresql/${{ matrix.postgres }}/bin/pg_config install
-
-      - name: Setup PostgreSQL and run basic tests (pure SPI, no liblbug)
-        run: |
-          sudo pg_ctlcluster ${{ matrix.postgres }} main start || true
-          sudo -u postgres createdb pg_ladybug_test 2>/dev/null || true
-          sudo cp test.sql /tmp/test.sql
-          sudo -u postgres psql -d pg_ladybug_test -v ON_ERROR_STOP=1 -f /tmp/test.sql
-
-      - name: Download prebuilt liblbug (for Cypher tests)
-        run: |
-          mkdir -p "${{ github.workspace }}/.lbug/lib"
-          LBUG_TARGET_DIR="${{ github.workspace }}/.lbug/lib" \
-            LBUG_LIB_KIND=shared \
-            bash scripts/download-liblbug.sh
-          echo "LBUG_LIB_PATH=${{ github.workspace }}/.lbug/lib/liblbug.so" >> "$GITHUB_ENV"
-
-      - name: Run Cypher tests (requires liblbug)
-        if: env.LBUG_LIB_PATH != ''
-        run: |
-          sudo -u postgres psql -d pg_ladybug_test -v ON_ERROR_STOP=1 <<'SQLEOF'
-            SET ladybug.lib_path = '${{ env.LBUG_LIB_PATH }}';
-            SET ladybug.pg_connstr = 'host=/var/run/postgresql port=5432 dbname=pg_ladybug_test user=postgres';
-
-            SELECT 'EXPLAIN test' AS info,
-                   length(ladybug.explain('MATCH (n:Person) RETURN n.id')) AS plan_len;
-
-            SELECT 'PUSHED SQL' AS info,
-                   ladybug.pushed_sql('MATCH (n:Person) RETURN n.id') AS sql;
-SQLEOF
-          echo "Cypher tests completed"
+          mkdir -p lib
+          LBUG_TARGET_DIR=$PWD/lib LBUG_LIB_KIND=shared bash scripts/download-liblbug.sh
+          # TODO: download libpg_client.lbug_extension alongside liblbug.so
+          # so the bridge can LOAD the pg_client extension for ATTACH.
+          # See: ladybug_bridge_attach_postgres() in ladybug_bridge.c
+      - name: Test on PostgreSQL ${{ matrix.pg }}
+        run: pg-build-test
