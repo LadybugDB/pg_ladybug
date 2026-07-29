@@ -19,8 +19,7 @@ tables — with native Postgres execution under the hood.
    SPI** against your local Postgres tables.
 5. Results stream back through a standard `SETOF record` SRF.
 
-No second query engine runs in your Postgres backend. `liblbug` is linked at
-build time and used purely as a Cypher → SQL compiler.
+We also support a second mode: run Cypher only queries that don't access Postgres tables at all. You can create ladybug tables just like you could in a standalone ladybug deployment. Data lives in `$PGDATA/storage.lbdb`. We don't support mixed mode execution in this release. Will consider it in the next release cycle.
 
 ## Requirements
 
