@@ -292,8 +292,81 @@ def main() -> int:
                      ") AS t(a_name text, b_name text, since text) ORDER BY a_name",
                      env, check=lambda o, e: ("Alice" in o and "Bob" in o and "2020-01-15" in o))
 
+            # ================================================================
+            # Declarative replication tests (Postgres -> Ladybug)
+            #   - enable_replication creates a conventional PUBLICATION
+            #   - AFTER row triggers convert SQL changes to standard Cypher
+            #     CREATE / MERGE / DELETE statements in _replication_log
+            #   - disable_replication tears everything down
+            # These tests are pure-SPI (no liblbug runtime dependency).
+            # ================================================================
+            run_test("Replication: setup tables + register into graph",
+                     "DROP TABLE IF EXISTS rrel_knows, rnode_person, rnode_city;"
+                     "CREATE TABLE rnode_person (id INT PRIMARY KEY, name TEXT, age INT);"
+                     "CREATE TABLE rnode_city (id INT PRIMARY KEY, name TEXT, population INT);"
+                     "CREATE TABLE rrel_knows (id INT PRIMARY KEY, src_id INT, dst_id INT, since INT);"
+                     "SELECT ladybug.register_node('Person','rnode_person','id',NULL,'repl');"
+                     "SELECT ladybug.register_node('City','rnode_city','id',NULL,'repl');"
+                     "SELECT ladybug.register_edge('KNOWS','rrel_knows','src_id','dst_id','id','repl');"
+                     "SELECT 'registered';",
+                     env, check=lambda o, e: "registered" in o)
+
+            run_test("Replication: enable_replication('repl')",
+                     "SELECT ladybug.enable_replication('repl') AS enabled_count",
+                     env, check=lambda o, e: "3" in o)
+
+            run_test("Replication: publication created by convention",
+                     "SELECT pubname FROM pg_publication WHERE pubname='ladybug_repl_pub'",
+                     env, check=lambda o, e: "ladybug_repl_pub" in o)
+
+            run_test("Replication: triggers installed",
+                     "SELECT count(*)::int AS n FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
+                     "WHERE c.relname IN ('rnode_person','rnode_city','rrel_knows')",
+                     env, check=lambda o, e: "3" in o)
+
+            run_test("Replication: status shows 3 rows",
+                     "SELECT count(*)::int AS n FROM ladybug.replication_status('repl')",
+                     env, check=lambda o, e: "3" in o)
+
+            run_test("Replication: INSERT -> Cypher CREATE (node)",
+                     "INSERT INTO rnode_person VALUES (1,'Alice',30), (2,'Bob',25);"
+                     "SELECT cypher FROM ladybug.replication_log('repl') "
+                     "WHERE operation='INSERT' AND label='Person' ORDER BY id",
+                     env, check=lambda o, e: "CREATE (n:Person {id: 1, name: 'Alice', age: 30})" in o)
+
+            run_test("Replication: INSERT -> Cypher CREATE (edge)",
+                     "INSERT INTO rrel_knows VALUES (1,1,2,2020);"
+                     "SELECT cypher FROM ladybug.replication_log('repl') "
+                     "WHERE operation='INSERT' AND label='KNOWS'",
+                     env, check=lambda o, e: "CREATE (a)-[r:KNOWS {id: 1" in o and "since: 2020}]->(b)" in o)
+
+            run_test("Replication: UPDATE -> Cypher MERGE",
+                     "UPDATE rnode_person SET name='Alicia', age=31 WHERE id=1;"
+                     "SELECT cypher FROM ladybug.replication_log('repl') "
+                     "WHERE operation='UPDATE' AND label='Person' ORDER BY id DESC LIMIT 1",
+                     env, check=lambda o, e: "MERGE (n:Person {id: 1}) SET n.name = 'Alicia', n.age = 31" in o)
+
+            run_test("Replication: DELETE -> Cypher MATCH ... DELETE",
+                     "DELETE FROM rnode_person WHERE id=2;"
+                     "SELECT cypher FROM ladybug.replication_log('repl') "
+                     "WHERE operation='DELETE' AND label='Person' ORDER BY id DESC LIMIT 1",
+                     env, check=lambda o, e: "MATCH (n:Person {id: 2}) DELETE n" in o)
+
+            run_test("Replication: disable_replication('repl')",
+                     "SELECT ladybug.disable_replication('repl') AS disabled_count",
+                     env, check=lambda o, e: "3" in o)
+
+            run_test("Replication: publication dropped after disable",
+                     "SELECT count(*)::int AS n FROM pg_publication WHERE pubname='ladybug_repl_pub'",
+                     env, check=lambda o, e: "0" in o)
+
+            run_test("Replication: triggers dropped after disable",
+                     "SELECT count(*)::int AS n FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
+                     "WHERE c.relname IN ('rnode_person','rnode_city','rrel_knows')",
+                     env, check=lambda o, e: "0" in o)
+
             print(f"\n=== {tests_passed}/{tests_total} tests passed ===")
-            # All 17 tests are required.
+            # All existing tests are required.
             if tests_passed >= tests_total:
                 print("All essential tests PASSED - compile-time linking works!")
                 return 0

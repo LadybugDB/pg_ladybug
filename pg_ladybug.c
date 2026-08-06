@@ -39,7 +39,9 @@
 #include "miscadmin.h"              /* DataDir */
 #include "catalog/pg_type.h"
 #include "access/htup_details.h"
+#include "commands/trigger.h"
 #include "nodes/execnodes.h"
+#include "lib/stringinfo.h"
 #include <string.h>
 
 PG_MODULE_MAGIC;
@@ -814,6 +816,463 @@ ladybug_pushed_sql(PG_FUNCTION_ARGS)
     pfree(sql);
 
     PG_RETURN_TEXT_P(result);
+}
+
+/* ------------------------------------------------------------------ */
+/* Replication: convert a SQL row change to a standard Cypher           */
+/* CREATE / MERGE / DELETE statement.                                  */
+/*                                                                     */
+/* The declarative entry point is ladybug.enable_replication(graph),    */
+/* which creates a Postgres PUBLICATION (conventional name) and an      */
+/* AFTER INSERT/UPDATE/DELETE row trigger on each registered node/rel   */
+/* table.  This trigger turns the changed row into a standard Cypher    */
+/* statement and records it in ladybug._replication_log (the change     */
+/* stream that the ladybug postgres client consumes as its "subscription". */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Render a single Datum as a Cypher literal.  Numeric and boolean values
+ * are emitted bare; every other value is emitted as a single-quoted Cypher
+ * string with embedded quotes doubled.
+ */
+static char *
+cypher_literal(Oid typid, Datum val)
+{
+    Oid         outfunc;
+    bool        isvarlena;
+    FmgrInfo    finfo;
+    char       *raw;
+    char       *copy;
+
+    char        typcategory;
+    bool        typispreferred;
+
+    getTypeOutputInfo(typid, &outfunc, &isvarlena);
+    fmgr_info(outfunc, &finfo);
+    raw = OutputFunctionCall(&finfo, val);
+
+    /* Determine the type category (PG18: get_type_category_preferred). */
+    get_type_category_preferred(typid, &typcategory, &typispreferred);
+    if (typcategory == TYPCATEGORY_NUMERIC ||
+        typcategory == TYPCATEGORY_BOOLEAN)
+    {
+        copy = pstrdup(raw);
+        pfree(raw);
+        return copy;
+    }
+    else
+    {
+        StringInfoData b;
+        const char *p;
+
+        initStringInfo(&b);
+        appendStringInfoChar(&b, '\'');
+        for (p = raw; *p; p++)
+        {
+            if (*p == '\'')
+                appendStringInfoChar(&b, '\'');
+            appendStringInfoChar(&b, *p);
+        }
+        appendStringInfoChar(&b, '\'');
+        copy = b.data;
+        pfree(raw);
+        return copy;
+    }
+}
+
+/*
+ * Fetch the named column of a row as a Cypher literal.  Uses SPI_getbinval
+ * so the SPI connection must be active when this is called.  Returns the
+ * string "null" when the column is NULL or does not exist.
+ */
+static char *
+row_column_literal(HeapTuple row, TupleDesc td, const char *colname, bool *found)
+{
+    int         i;
+
+    *found = false;
+    for (i = 0; i < td->natts; i++)
+    {
+        if (strcmp(NameStr(TupleDescAttr(td, i)->attname), colname) == 0)
+        {
+            bool        isnull;
+            Datum       d;
+
+            *found = true;
+            d = SPI_getbinval(row, td, i + 1, &isnull);
+            if (isnull)
+                return pstrdup("null");
+            return cypher_literal(TupleDescAttr(td, i)->atttypid, d);
+        }
+    }
+    return pstrdup("null");
+}
+
+/* Append ", col: literal" for every column of the row. */
+static void
+append_all_props(StringInfo s, HeapTuple row, TupleDesc td)
+{
+    int         i;
+
+    for (i = 0; i < td->natts; i++)
+    {
+        bool        isnull;
+        Datum       d;
+        char       *lit;
+
+        if (i > 0)
+            appendStringInfoString(s, ", ");
+        d = SPI_getbinval(row, td, i + 1, &isnull);
+        lit = isnull ? pstrdup("null")
+                     : cypher_literal(TupleDescAttr(td, i)->atttypid, d);
+        appendStringInfo(s, "%s: %s",
+                         NameStr(TupleDescAttr(td, i)->attname), lit);
+        pfree(lit);
+    }
+}
+
+/* Append "n.col = literal, ..." (SET clause) for every column except id. */
+static void
+append_set_items(StringInfo s, HeapTuple row, TupleDesc td,
+                 const char *idcol, const char *var)
+{
+    int         i;
+    bool        first = true;
+
+    for (i = 0; i < td->natts; i++)
+    {
+        const char *name = NameStr(TupleDescAttr(td, i)->attname);
+        bool        isnull;
+        Datum       d;
+        char       *lit;
+
+        if (idcol && strcmp(name, idcol) == 0)
+            continue;
+        d = SPI_getbinval(row, td, i + 1, &isnull);
+        lit = isnull ? pstrdup("null")
+                     : cypher_literal(TupleDescAttr(td, i)->atttypid, d);
+        if (!first)
+            appendStringInfoString(s, ", ");
+        appendStringInfo(s, "%s.%s = %s", var, name, lit);
+        first = false;
+        pfree(lit);
+    }
+}
+
+/*
+ * Build the standard Cypher statement for a row change.
+ *   INSERT: CREATE (n:Label {cols...})
+ *   UPDATE: MERGE (n:Label {id: ..}) SET n.col = .., ..
+ *   DELETE: MATCH (n:Label {id: ..}) DELETE n
+ * For edge (rel) tables the endpoints are matched by their id column and
+ * the relationship is created/merged between them.
+ */
+static char *
+build_replication_cypher(HeapTuple row, TupleDesc td,
+                         const char *kind, const char *label,
+                         const char *idcol, const char *fromcol,
+                         const char *tocol, char op)
+{
+    StringInfoData s;
+    bool        found;
+
+    initStringInfo(&s);
+
+    if (strcmp(kind, "edge") == 0)
+    {
+        char       *f = row_column_literal(row, td, fromcol, &found);
+        char       *t = row_column_literal(row, td, tocol, &found);
+        char       *id = row_column_literal(row, td, idcol, &found);
+
+        if (op == 'I')
+        {
+            appendStringInfoString(&s, "MATCH (a {id: ");
+            appendStringInfoString(&s, f);
+            appendStringInfoString(&s, "}), (b {id: ");
+            appendStringInfoString(&s, t);
+            appendStringInfoString(&s, "}) CREATE (a)-[r:");
+            appendStringInfoString(&s, label);
+            appendStringInfoString(&s, " {id: ");
+            appendStringInfoString(&s, id);
+            appendStringInfoString(&s, ", ");
+            append_all_props(&s, row, td);
+            appendStringInfoString(&s, "}]->(b)");
+        }
+        else if (op == 'U')
+        {
+            appendStringInfoString(&s, "MATCH (a {id: ");
+            appendStringInfoString(&s, f);
+            appendStringInfoString(&s, "}), (b {id: ");
+            appendStringInfoString(&s, t);
+            appendStringInfoString(&s, "}) MERGE (a)-[r:");
+            appendStringInfoString(&s, label);
+            appendStringInfoString(&s, " {id: ");
+            appendStringInfoString(&s, id);
+            appendStringInfoString(&s, "}]->(b) SET ");
+            append_set_items(&s, row, td, idcol, "r");
+        }
+        else
+        {
+            appendStringInfoString(&s, "MATCH ()-[r:");
+            appendStringInfoString(&s, label);
+            appendStringInfoString(&s, " {id: ");
+            appendStringInfoString(&s, id);
+            appendStringInfoString(&s, "}]->() DELETE r");
+        }
+        pfree(f);
+        pfree(t);
+        pfree(id);
+    }
+    else
+    {
+        char       *id = row_column_literal(row, td, idcol, &found);
+
+        if (op == 'I')
+        {
+            appendStringInfoString(&s, "CREATE (n:");
+            appendStringInfoString(&s, label);
+            appendStringInfoString(&s, " {");
+            append_all_props(&s, row, td);
+            appendStringInfoString(&s, "})");
+        }
+        else if (op == 'U')
+        {
+            appendStringInfoString(&s, "MERGE (n:");
+            appendStringInfoString(&s, label);
+            appendStringInfoString(&s, " {id: ");
+            appendStringInfoString(&s, id);
+            appendStringInfoString(&s, "}) SET ");
+            append_set_items(&s, row, td, idcol, "n");
+        }
+        else
+        {
+            appendStringInfoString(&s, "MATCH (n:");
+            appendStringInfoString(&s, label);
+            appendStringInfoString(&s, " {id: ");
+            appendStringInfoString(&s, id);
+            appendStringInfoString(&s, "}) DELETE n");
+        }
+        pfree(id);
+    }
+
+    return s.data;
+}
+
+/* ------------------------------------------------------------------ */
+/* ladybug_replication_trigger() -> trigger                            */
+/* AFTER INSERT/UPDATE/DELETE row trigger installed by                  */
+/* ladybug.enable_replication().  Converts the changed row into a       */
+/* standard Cypher CREATE/MERGE/DELETE statement and records it in      */
+/* ladybug._replication_log (the change stream consumed as the          */
+/* "subscription" by the ladybug postgres client).                     */
+/*                                                                     */
+/* Trigger args: graph, kind, label, id_column[, from_col, to_col]      */
+/* ------------------------------------------------------------------ */
+PG_FUNCTION_INFO_V1(ladybug_replication_trigger);
+
+Datum
+ladybug_replication_trigger(PG_FUNCTION_ARGS)
+{
+    TriggerData *trigdata = (TriggerData *) fcinfo->context;
+    int         nargs;
+    char      **args;
+    const char *graph;
+    const char *kind;
+    const char *label;
+    const char *idcol;
+    const char *fromcol = NULL;
+    const char *tocol = NULL;
+    Relation    rel;
+    TupleDesc   td;
+    const char *opname;
+    char        op;
+    HeapTuple   row;
+    char       *cypher;
+    char       *tblname;
+    StringInfoData ins;
+    int         ret;
+
+    if (!CALLED_AS_TRIGGER(fcinfo))
+        ereport(ERROR,
+                (errmsg("ladybug.replication_trigger() must be called as a trigger")));
+    if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+        ereport(ERROR,
+                (errmsg("ladybug.replication_trigger() must be a row-level trigger")));
+
+    nargs = trigdata->tg_trigger->tgnargs;
+    args = trigdata->tg_trigger->tgargs;
+    if (nargs < 4)
+        ereport(ERROR,
+                (errmsg("ladybug.replication_trigger() requires trigger args "
+                        "(graph, kind, label, id_column[, from_col, to_col])")));
+    graph = args[0];
+    kind = args[1];
+    label = args[2];
+    idcol = args[3];
+    if (nargs >= 6)
+    {
+        fromcol = args[4];
+        tocol = args[5];
+    }
+
+    rel = trigdata->tg_relation;
+    td = RelationGetDescr(rel);
+    tblname = MemoryContextStrdup(CurrentMemoryContext,
+                                  RelationGetRelationName(rel));
+
+    /*
+     * tg_trigtuple is always set for row-level triggers: the inserted row
+     * (INSERT), the old row (UPDATE/DELETE).  tg_newtuple holds the new row
+     * for UPDATE only (it is NULL for INSERT, even for AFTER triggers).
+     * We always want the *new* values for INSERT/UPDATE.
+     */
+    if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+    {
+        op = 'I';
+        opname = "INSERT";
+        row = trigdata->tg_trigtuple;
+    }
+    else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+    {
+        op = 'U';
+        opname = "UPDATE";
+        row = trigdata->tg_newtuple;
+    }
+    else
+    {
+        op = 'D';
+        opname = "DELETE";
+        row = trigdata->tg_trigtuple;
+    }
+
+    /* Connect so SPI_getbinval and the log INSERT work. */
+    ret = SPI_connect();
+    if (ret != SPI_OK_CONNECT)
+        ereport(ERROR,
+                (errmsg("ladybug: replication trigger: SPI_connect failed")));
+
+    cypher = build_replication_cypher(row, td, kind, label, idcol,
+                                      fromcol, tocol, op);
+
+    initStringInfo(&ins);
+    appendStringInfoString(&ins,
+                           "INSERT INTO ladybug._replication_log "
+                           "(graph, kind, label, table_name, operation, cypher) "
+                           "VALUES (");
+    appendStringInfoString(&ins, quote_literal_cstr(graph));
+    appendStringInfoString(&ins, ", ");
+    appendStringInfoString(&ins, quote_literal_cstr(kind));
+    appendStringInfoString(&ins, ", ");
+    appendStringInfoString(&ins, quote_literal_cstr(label));
+    appendStringInfoString(&ins, ", ");
+    appendStringInfoString(&ins, quote_literal_cstr(tblname));
+    appendStringInfoString(&ins, ", ");
+    appendStringInfoString(&ins, quote_literal_cstr(opname));
+    appendStringInfoString(&ins, ", ");
+    appendStringInfoString(&ins, quote_literal_cstr(cypher));
+    appendStringInfoString(&ins, ")");
+
+    ret = SPI_execute(ins.data, false, 0);
+    if (ret < 0)
+        ereport(WARNING,
+                (errmsg("ladybug: replication trigger could not record change")));
+
+    SPI_finish();
+
+    /* AFTER triggers: the return value is ignored. */
+    return PointerGetDatum(trigdata->tg_trigtuple);
+}
+
+/* ------------------------------------------------------------------ */
+/* ladybug.replay_replication(graph) -> int                            */
+/* Replay the captured change stream (ladybug._replication_log) as      */
+/* Cypher statements into the embedded Ladybug engine, so the graph     */
+/* data is (re)materialised in ladybug native storage.  This is the     */
+/* apply side of the "subscription": it consumes the SQL->Cypher        */
+/* statements and hands each to the embedded ladybug connection.  Statements      */
+/* that fail (e.g. missing native node/rel table) are skipped, and the  */
+/* number of successfully applied statements is returned.               */
+/* ------------------------------------------------------------------ */
+PG_FUNCTION_INFO_V1(ladybug_replay_replication);
+
+Datum
+ladybug_replay_replication(PG_FUNCTION_ARGS)
+{
+    text           *graph_text;
+    char           *graph;
+    const char     *err_msg = NULL;
+    LadybugBridge  *b;
+    int             nrows = 0;
+    int             ncols = 0;
+    SPITupleTable  *tuptable = NULL;
+    int             applied = 0;
+    int             failed = 0;
+    int             i;
+
+    if (PG_ARGISNULL(0))
+        ereport(ERROR,
+                (errmsg("ladybug.replay_replication(): NULL argument is not allowed")));
+    graph_text = PG_GETARG_TEXT_PP(0);
+    graph = text_to_cstring(graph_text);
+
+    b = ladybug_bridge_acquire(&err_msg);
+    if (b == NULL)
+    {
+        if (err_msg)
+            ereport(ERROR,
+                    (errmsg("ladybug: cannot initialize Ladybug engine"),
+                     errdetail("%s", err_msg)));
+        else
+            ereport(ERROR,
+                    (errmsg("ladybug: cannot initialize Ladybug engine")));
+    }
+
+    nrows = spi_execute_and_capture(
+                psprintf("SELECT cypher FROM ladybug._replication_log "
+                         "WHERE graph = %s ORDER BY id",
+                         quote_literal_cstr(graph)),
+                &tuptable, &ncols);
+
+    if (nrows > 0 && tuptable != NULL)
+    {
+        for (i = 0; i < nrows; i++)
+        {
+            char       *cypher;
+            char       *res;
+            const char *e = NULL;
+
+            cypher = SPI_getvalue(tuptable->vals[i], tuptable->tupdesc, 1);
+            if (cypher == NULL)
+                continue;
+            res = ladybug_bridge_direct_sql(b, cypher, &e);
+            if (res != NULL)
+            {
+                pfree(res);
+                applied++;
+            }
+            else
+            {
+                failed++;
+                ereport(NOTICE,
+                        (errmsg("ladybug: replay skipped: %s",
+                                cypher),
+                         e ? errdetail("%s", e) : 0));
+                if (e)
+                    pfree((char *) e);
+            }
+            pfree(cypher);
+        }
+    }
+
+    SPI_finish();
+    pfree(graph);
+
+    if (failed > 0)
+        ereport(NOTICE,
+                (errmsg("ladybug: replayed %d change(s), skipped %d (ensure native "
+                        "ladybug node/rel tables exist)", applied, failed)));
+
+    PG_RETURN_INT32(applied);
 }
 
 /* ------------------------------------------------------------------ */
