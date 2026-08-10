@@ -35,7 +35,7 @@ def main() -> int:
     # do not).  This lets a builder select a specific compiler and/or repair a
     # stale -isysroot baked into a bundled pg_config after an Xcode upgrade.
     make_overrides = []
-    for var in ("CC", "PG_SYSROOT"):
+    for var in ("CC", "CXX", "PG_SYSROOT"):
         val = env_build.get(var)
         if val:
             make_overrides.append(f"{var}={val}")
@@ -383,6 +383,49 @@ def main() -> int:
                      "SELECT count(*)::int AS n FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
                      "WHERE c.relname IN ('rnode_person','rnode_city','rrel_knows')",
                      env, check=lambda o, e: "0" in o)
+
+            # ================================================================
+            # Issue #2 regression: replay the same change log twice across two
+            # SEPARATE backends.  The first replay materialises a row into a
+            # persistent ladybug store; the second replay, in a fresh
+            # backend, reopens that store and re-runs the same CREATE, which
+            # hits a duplicate primary key.  Before the fix, liblbug threw a
+            # std::out_of_range past its C API, std::terminate ran, and the
+            # backend died with SIGABRT (taking the whole cluster down).  The
+            # fix wraps the executing liblbug calls in a C++ catch(...) \n            # boundary (ladybug_bridge_guard.cpp); the duplicate must now be
+            # reported as a skipped statement and return 0, not crash.
+            #
+            # Each run_test() is a separate `psql -c` process, hence a
+            # separate backend / bridge / reopened store -- exactly the
+            # scenario from the issue.
+            # ================================================================
+            REPLAY_STORE = "/tmp/pglb_issue2_replay.lbdb"
+            run_test("Issue #2 setup: node table + register + insert (graph 'repl2')",
+                     "DROP TABLE IF EXISTS rnode_city2;"
+                     "CREATE TABLE rnode_city2 (id INT PRIMARY KEY, name TEXT NOT NULL);"
+                     "SELECT ladybug.register_node('City','rnode_city2','id',NULL,'repl2');"
+                     "SELECT ladybug.enable_replication('repl2') AS n;"
+                     "INSERT INTO rnode_city2 VALUES (1,'Toronto');"
+                     "SELECT 'ok' AS setup;",
+                     env, check=lambda o, e: "ok" in o)
+
+            run_test("Issue #2: first replay (backend A) materialises the row",
+                     f"SET ladybug.storage_path = '{REPLAY_STORE}';"
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}';"
+                     "SELECT * FROM ladybug.cypher("  # create native node table
+                     "'CREATE NODE TABLE City(id INT64, name STRING, PRIMARY KEY(id))') AS t(ok text);"
+                     "SELECT ladybug.replay_replication('repl2') AS applied;",
+                     env, check=lambda o, e: "1" in o)
+
+            run_test("Issue #2: second replay (backend B, reopened store) must not crash",
+                     f"SET ladybug.storage_path = '{REPLAY_STORE}';"
+                     "SELECT ladybug.replay_replication('repl2') AS second_replay;",
+                     env, check=lambda o, e: "0" in o and "0" in o)
+
+            # Cleanup the dedicated graph so the suite is idempotent.
+            run_test("Issue #2 cleanup: disable_replication('repl2')",
+                     "SELECT ladybug.disable_replication('repl2') AS n",
+                     env, check=lambda o, e: "1" in o)
 
             print(f"\n=== {tests_passed}/{tests_total} tests passed ===")
             # All existing tests are required.

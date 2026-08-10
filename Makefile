@@ -4,7 +4,7 @@
 MODULE_big = pg_ladybug
 EXTENSION = pg_ladybug
 DATA = pg_ladybug--1.0.sql
-OBJS = $(WIN32RES) pg_ladybug.o ladybug_bridge.o
+OBJS = $(WIN32RES) pg_ladybug.o ladybug_bridge.o ladybug_bridge_guard.o
 PG_CPPFLAGS = -I.
 # Search the vendored lib/ *before* any system liblbug (PG_LDFLAGS is
 # prepended to LDFLAGS by PGXS, so it wins over -L paths baked into pg_config,
@@ -15,6 +15,16 @@ PG_CONFIG ?= pg_config
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Link the C++ runtime: ladybug_bridge_guard.o is C++ (compiled with $(CXX))
+# and PGXS links the shared library with the C driver ($(CC)), so the C++
+# runtime must be pulled in explicitly.  Without it the link fails with
+# undefined symbols for std::exception / __cxa_throw.
+ifeq ($(PORTNAME), darwin)
+SHLIB_LINK += -lc++
+else
+SHLIB_LINK += -lstdc++
+endif
 
 # Convenience test targets (local postgres, requires liblbug.so)
 # -------------------------------------------------------------------
