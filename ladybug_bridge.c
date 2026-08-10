@@ -63,6 +63,23 @@ int    ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b, const char *q
 int    ladybug_bridge_execute_collect(LadybugBridge *b, const char *query, TupleDesc tupdesc, HeapTuple **out_tuples, const char **err_msg);
 void   ladybug_bridge_release(LadybugBridge *b);
 
+/* ---------------------------------------------------------------- */
+/*  C++ exception-boundary guards (ladybug_bridge_guard.cpp).         */
+/*  liblbug is C++ and can throw past its C API; these wrap the calls  */
+/*  on the executing/planning paths so an escaped exception is turned  */
+/*  into an error string (*gerr, palloc'd) + LbugError instead of     */
+/*  unwinding into the PG backend (SIGABRT).  See issue #2.           */
+/* ---------------------------------------------------------------- */
+lbug_state ladybug_guard_database_init(const char *path, lbug_system_config cfg,
+                                       lbug_database *out, const char **gerr);
+lbug_state ladybug_guard_connection_init(lbug_database *db, lbug_connection *out,
+                                         const char **gerr);
+lbug_state ladybug_guard_connection_query(lbug_connection *conn, const char *query,
+                                         lbug_query_result *out, const char **gerr);
+lbug_state ladybug_guard_connection_get_pushed_sql(lbug_connection *conn,
+                                                   const char *cypher, char **out_sql,
+                                                   const char **gerr);
+
 /* ================================================================ */
 /*  Internal helpers                                                 */
 /* ================================================================ */
@@ -104,11 +121,13 @@ ladybug_bridge_acquire(const char **err_msg)
         storage_path = pstrdup(storage_path_guc);
         storage_attempted = true;
 
-        st = lbug_database_init(storage_path, cfg, &bridge.database);
+        const char *gerr = NULL;
+        st = ladybug_guard_database_init(storage_path, cfg, &bridge.database, &gerr);
         if (st == 0)
         {
             /* Storage init succeeded; now create the connection. */
-            st = lbug_connection_init(&bridge.database, &bridge.connection);
+            const char *gerr2 = NULL;
+            st = ladybug_guard_connection_init(&bridge.database, &bridge.connection, &gerr2);
             if (st != 0)
             {
                 /*
@@ -118,8 +137,11 @@ ladybug_bridge_acquire(const char **err_msg)
                  * fallback-to-in-memory contract).
                  */
                 if (storage_err == NULL)
-                    storage_err = psprintf("lbug_connection_init failed (state=%d) for storage '%s'",
-                                           (int)st, storage_path);
+                    storage_err = gerr2 ? (char *) gerr2 :
+                        psprintf("lbug_connection_init failed (state=%d) for storage '%s'",
+                                 (int)st, storage_path);
+                else if (gerr2)
+                    pfree((char *) gerr2);
                 lbug_database_destroy(&bridge.database);
                 pfree(storage_path);
                 storage_path = NULL;
@@ -139,8 +161,11 @@ ladybug_bridge_acquire(const char **err_msg)
         else
         {
             if (storage_err == NULL)
-                storage_err = psprintf("lbug_database_init failed (state=%d) for storage '%s'",
-                                       (int)st, storage_path);
+                storage_err = gerr ? (char *) gerr :
+                    psprintf("lbug_database_init failed (state=%d) for storage '%s'",
+                             (int)st, storage_path);
+            else if (gerr)
+                pfree((char *) gerr);
             pfree(storage_path);
             storage_path = NULL;
             /* Fall through to in-memory fallback below. */
@@ -148,39 +173,53 @@ ladybug_bridge_acquire(const char **err_msg)
     }
 
     /* Fall back to in-memory mode. */
-    st = lbug_database_init(":memory:", cfg, &bridge.database);
-    if (st != 0)
     {
-        if (err_msg)
+        const char *gerr = NULL;
+        st = ladybug_guard_database_init(":memory:", cfg, &bridge.database, &gerr);
+        if (st != 0)
         {
-            if (storage_attempted && storage_err != NULL)
-                *err_msg = psprintf("ladybug: %s; in-memory fallback also failed (state=%d)",
-                                    storage_err, (int)st);
-            else
-                *err_msg = psprintf("ladybug: lbug_database_init failed (state=%d) for :memory:",
-                                    (int)st);
+            if (err_msg)
+            {
+                if (storage_attempted && storage_err != NULL)
+                    *err_msg = psprintf("ladybug: %s; in-memory fallback also failed (state=%d)",
+                                        storage_err, (int)st);
+                else if (gerr != NULL)
+                    *err_msg = psprintf("ladybug: %s", gerr);
+                else
+                    *err_msg = psprintf("ladybug: lbug_database_init failed (state=%d) for :memory:",
+                                         (int)st);
+            }
+            if (gerr) pfree((char *) gerr);
+            if (storage_err) pfree(storage_err);
+            memset(&bridge, 0, sizeof(bridge));
+            return NULL;
         }
-        if (storage_err) pfree(storage_err);
-        memset(&bridge, 0, sizeof(bridge));
-        return NULL;
+        if (gerr) pfree((char *) gerr);
     }
 
-    st = lbug_connection_init(&bridge.database, &bridge.connection);
-    if (st != 0)
     {
-        if (err_msg)
+        const char *gerr = NULL;
+        st = ladybug_guard_connection_init(&bridge.database, &bridge.connection, &gerr);
+        if (st != 0)
         {
-            if (storage_attempted && storage_err != NULL)
-                *err_msg = psprintf("ladybug: %s; in-memory connection init also failed (state=%d)",
-                                    storage_err, (int)st);
-            else
-                *err_msg = psprintf("ladybug: lbug_connection_init failed (state=%d) for :memory:",
-                                    (int)st);
+            if (err_msg)
+            {
+                if (storage_attempted && storage_err != NULL)
+                    *err_msg = psprintf("ladybug: %s; in-memory connection init also failed (state=%d)",
+                                        storage_err, (int)st);
+                else if (gerr != NULL)
+                    *err_msg = psprintf("ladybug: %s", gerr);
+                else
+                    *err_msg = psprintf("ladybug: lbug_connection_init failed (state=%d) for :memory:",
+                                        (int)st);
+            }
+            if (gerr) pfree((char *) gerr);
+            lbug_database_destroy(&bridge.database);
+            if (storage_err) pfree(storage_err);
+            memset(&bridge, 0, sizeof(bridge));
+            return NULL;
         }
-        lbug_database_destroy(&bridge.database);
-        if (storage_err) pfree(storage_err);
-        memset(&bridge, 0, sizeof(bridge));
-        return NULL;
+        if (gerr) pfree((char *) gerr);
     }
 
     bridge.inited = true;
@@ -227,17 +266,34 @@ ladybug_bridge_direct_sql(LadybugBridge *b, const char *sql, const char **err_ms
 
     memset(&result, 0, sizeof(result));
 
-    st = lbug_connection_query(&b->connection, sql, &result);
-    if (st != 0 || !lbug_query_result_is_success(&result))
     {
-        lbug_err = lbug_query_result_get_error_message(&result);
-        if (err_msg)
-            *err_msg = psprintf("ladybug: query failed: %s",
-                                lbug_err ? lbug_err : "(no error message)");
-        if (lbug_err)
-            lbug_destroy_string(lbug_err);
-        lbug_query_result_destroy(&result);
-        return NULL;
+        const char *gerr = NULL;
+        st = ladybug_guard_connection_query(&b->connection, sql, &result, &gerr);
+        if (st != 0 || !lbug_query_result_is_success(&result))
+        {
+            /*
+             * Exception path: the guard already destroyed and zeroed
+             * the result handle, so surface its message directly and do
+             * not touch result accessors.
+             */
+            if (gerr != NULL)
+            {
+                if (err_msg)
+                    *err_msg = pstrdup(gerr);
+                pfree((char *) gerr);
+                return NULL;
+            }
+            /* Ordinary liblbug error: result is valid, read its message. */
+            lbug_err = lbug_query_result_get_error_message(&result);
+            if (err_msg)
+                *err_msg = psprintf("ladybug: query failed: %s",
+                                    lbug_err ? lbug_err : "(no error message)");
+            if (lbug_err)
+                lbug_destroy_string(lbug_err);
+            lbug_query_result_destroy(&result);
+            return NULL;
+        }
+        if (gerr) pfree((char *) gerr);
     }
 
     raw = lbug_query_result_to_string(&result);
@@ -430,23 +486,39 @@ ladybug_bridge_pushed_sql(LadybugBridge *b, const char *cypher, const char **err
         return NULL;
     }
 
-    st = lbug_connection_get_pushed_sql(&b->connection, cypher, &sql);
-    if (st != LbugSuccess || sql == NULL)
     {
-        char *lbug_err;
-
-        lbug_err = lbug_get_last_error();
-        if (err_msg)
+        const char *gerr = NULL;
+        st = ladybug_guard_connection_get_pushed_sql(&b->connection, cypher, &sql, &gerr);
+        if (st != LbugSuccess || sql == NULL)
         {
-            if (lbug_err)
-                *err_msg = psprintf("ladybug: could not extract pushed-down SQL: %s", lbug_err);
-            else
-                *err_msg = pstrdup("ladybug: could not extract pushed-down SQL "
-                                    "(no pushdown operator found in plan). "
-                                    "Use ladybug.explain() for the full plan.");
+            char *lbug_err;
+
+            /*
+             * Exception path: the guard freed/cleared sql already; surface
+             * the caught-exception message directly.
+             */
+            if (gerr != NULL)
+            {
+                if (err_msg)
+                    *err_msg = pstrdup(gerr);
+                pfree((char *) gerr);
+                return NULL;
+            }
+
+            lbug_err = lbug_get_last_error();
+            if (err_msg)
+            {
+                if (lbug_err)
+                    *err_msg = psprintf("ladybug: could not extract pushed-down SQL: %s", lbug_err);
+                else
+                    *err_msg = pstrdup("ladybug: could not extract pushed-down SQL "
+                                        "(no pushdown operator found in plan). "
+                                        "Use ladybug.explain() for the full plan.");
+            }
+            if (lbug_err) lbug_destroy_string(lbug_err);
+            return NULL;
         }
-        if (lbug_err) lbug_destroy_string(lbug_err);
-        return NULL;
+        if (gerr) pfree((char *) gerr);
     }
 
     /* sql is now an lbug-allocated string; copy it to palloc'd memory */
@@ -540,17 +612,28 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
 
     memset(&result, 0, sizeof(result));
 
-    st = lbug_connection_query(&b->connection, query, &result);
-    if (st != 0 || !lbug_query_result_is_success(&result))
     {
-        lbug_err = lbug_query_result_get_error_message(&result);
-        if (err_msg)
-            *err_msg = psprintf("ladybug: query failed: %s",
-                                lbug_err ? lbug_err : "(no error message)");
-        if (lbug_err)
-            lbug_destroy_string(lbug_err);
-        lbug_query_result_destroy(&result);
-        return -1;
+        const char *gerr = NULL;
+        st = ladybug_guard_connection_query(&b->connection, query, &result, &gerr);
+        if (st != 0 || !lbug_query_result_is_success(&result))
+        {
+            if (gerr != NULL)
+            {
+                if (err_msg)
+                    *err_msg = pstrdup(gerr);
+                pfree((char *) gerr);
+                return -1;
+            }
+            lbug_err = lbug_query_result_get_error_message(&result);
+            if (err_msg)
+                *err_msg = psprintf("ladybug: query failed: %s",
+                                    lbug_err ? lbug_err : "(no error message)");
+            if (lbug_err)
+                lbug_destroy_string(lbug_err);
+            lbug_query_result_destroy(&result);
+            return -1;
+        }
+        if (gerr) pfree((char *) gerr);
     }
 
     num_cols = (int)lbug_query_result_get_num_columns(&result);
@@ -700,17 +783,30 @@ ladybug_bridge_execute_collect(LadybugBridge *b,
 
     memset(&result, 0, sizeof(result));
 
-    st = lbug_connection_query(&b->connection, query, &result);
-    if (st != 0 || !lbug_query_result_is_success(&result))
     {
-        lbug_err = lbug_query_result_get_error_message(&result);
-        if (err_msg)
-            *err_msg = psprintf("ladybug: query failed: %s",
-                                lbug_err ? lbug_err : "(no error message)");
-        if (lbug_err)
-            lbug_destroy_string(lbug_err);
-        lbug_query_result_destroy(&result);
-        return -1;
+        const char *gerr = NULL;
+        st = ladybug_guard_connection_query(&b->connection, query, &result, &gerr);
+        if (st != 0 || !lbug_query_result_is_success(&result))
+        {
+            if (gerr != NULL)
+            {
+                if (err_msg)
+                    *err_msg = pstrdup(gerr);
+                pfree((char *) gerr);
+                *out_tuples = NULL;
+                return -1;
+            }
+            lbug_err = lbug_query_result_get_error_message(&result);
+            if (err_msg)
+                *err_msg = psprintf("ladybug: query failed: %s",
+                                    lbug_err ? lbug_err : "(no error message)");
+            if (lbug_err)
+                lbug_destroy_string(lbug_err);
+            lbug_query_result_destroy(&result);
+            *out_tuples = NULL;
+            return -1;
+        }
+        if (gerr) pfree((char *) gerr);
     }
 
     num_cols = (int)lbug_query_result_get_num_columns(&result);
