@@ -470,6 +470,48 @@ def main() -> int:
                      "SELECT ladybug.disable_replication('repl2') AS n",
                      env, check=lambda o, e: "1" in o)
 
+            # ================================================================
+            # Issue #6 regression: a successful zero-column Cypher statement
+            # (e.g. a data CREATE / MERGE / DELETE without RETURN) executes
+            # successfully in Ladybug and then must NOT be reported to the
+            # caller as a column-count-mismatch error.  Before the fix,
+            # ladybug_bridge_execute_collect rejected any result whose
+            # column count didn't match the caller's column definition
+            # list, so a statement that legitimately returns 0 columns
+            # failed at the column-count check -- after the side effect
+            # had already landed, inviting unsafe retries.
+            #
+            # The whole sequence runs in ONE backend against a dedicated
+            # storage path: create the native node table (DDL returns a
+            # status column, already fine), then a data CREATE (returns 0
+            # columns -> synthesized "OK" status row for the conventional
+            # AS t(ok text) shape), then a MERGE (0 columns, but the
+            # caller's column list is int -> honest empty result, count 0,
+            # NOT an error), then a MATCH confirming both writes landed.
+            # All four statements share one psql -c so the store is
+            # created and reused in a single backend.
+            # ================================================================
+            ISSUE6_STORE = "/tmp/pglb_issue6.lbdb"
+            run_test("Issue #6: zero-column Cypher mutations succeed (not reported as errors)",
+                     f"SET ladybug.storage_path = '{ISSUE6_STORE}';"
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}';"
+                     "SELECT * FROM ladybug.cypher("  # create native node table (DDL)
+                     "$$CREATE NODE TABLE City(id INT64, name STRING, PRIMARY KEY(id))$$)"
+                     " AS t(ok text);"
+                     "SELECT * FROM ladybug.cypher("  # data CREATE -> 0 columns -> "OK"
+                     "$$CREATE (n:City {id: 1, name: 'Toronto'})$$)"
+                     " AS t(ok text);"
+                     "SELECT count(*)::int AS cnt FROM ladybug.cypher("  # MERGE -> 0 columns, int col -> empty
+                     "$$MERGE (n:City {id: 2, name: 'Montreal'})$$)"
+                     " AS t(dummy int);"
+                     "SELECT * FROM ladybug.cypher("  # confirm both writes landed
+                     "$$MATCH (n:City) RETURN n.id, n.name ORDER BY n.id$$)"
+                     " AS t(id bigint, name text)",
+                     env, check=lambda o, e: ("OK" in o
+                                              and "Toronto" in o
+                                              and "Montreal" in o
+                                              and "ERROR" not in e.upper()))
+
             xfail_note = f" ({tests_xfail} xfail)" if tests_xfail else ""
             print(f"\n=== {tests_passed}/{tests_total} tests passed{xfail_note} ===")
             # All existing tests are required.
