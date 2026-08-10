@@ -83,7 +83,7 @@ def main() -> int:
         tests_total += 1
         print(f"\n--- Test {tests_total}: {name} ---")
         result = subprocess.run(
-            ["psql", "-c", sql], env=env, capture_output=True, text=True,
+            [psql, "-c", sql], env=env, capture_output=True, text=True,
         )
         if result.stdout:
             for line in result.stdout.strip().split("\n")[:25]:
@@ -166,13 +166,37 @@ def main() -> int:
             socket_dir = query.get("host", ["/tmp"])[0]
 
             env = os.environ.copy()
-            # Ensure the embedded PG's client binaries (psql) are on PATH.
-            env["PATH"] = f"{_pgembed_dir / 'bin'}{os.pathsep}{env.get('PATH', '')}"
             env["PGHOST"] = socket_dir
             env["PGPORT"] = "5432"
             env["PGUSER"] = "ci"
             env["PGPASSWORD"] = "ci"
             env["PGDATABASE"] = "ladybug_test"
+
+            # Pick a psql client that actually works against the embedded
+            # server.  Prefer the one bundled with pgembed (the only psql a
+            # bare macOS dev box is guaranteed to have), but probe it with a
+            # real connection first: the bundled Linux binaries in pgembed
+            # 0.2.0 segfault (SIGSEGV, no output) in the libpq connect path,
+            # so fall back to the system psql (postgresql-client) when the
+            # probe fails.  Invoke everything by absolute path.
+            def psql_probe_ok(psql_path: str) -> bool:
+                probe = subprocess.run(
+                    [psql_path, "-c", "SELECT 1"],
+                    env=env, capture_output=True, text=True, timeout=30,
+                )
+                return probe.returncode == 0
+
+            bundled_psql = _pgembed_dir / "bin" / "psql"
+            if bundled_psql.exists() and psql_probe_ok(str(bundled_psql)):
+                psql = str(bundled_psql)
+                print(f"Using pgembed-bundled psql: {psql}")
+            elif shutil.which("psql"):
+                psql = shutil.which("psql")
+                print(f"Using system psql: {psql}")
+            else:
+                print("ERROR: no working psql found "
+                      "(pgembed probe failed and no system psql on PATH)")
+                return 1
 
             libpq_connstr = f"host={socket_dir} port=5432 dbname=ladybug_test user=ci password=ci"
 
@@ -221,7 +245,7 @@ def main() -> int:
             print(f"\n--- Test 7: Bridge: pushed_sql RETURN 1 (expected error) ---")
             tests_total += 1
             result = subprocess.run(
-                ["psql", "-c",
+                [psql, "-c",
                  f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
                  "SELECT ladybug.pushed_sql('RETURN 1')"],
                 env=env, capture_output=True, text=True,
