@@ -642,6 +642,43 @@ ladybug_bridge_fill_tuplestore_from_query(LadybugBridge *b,
 
     if (num_cols != natts)
     {
+        /*
+         * A successful statement that returns no result schema
+         * (num_cols == 0) -- e.g. a data CREATE/MERGE/DELETE without
+         * RETURN, or a CALL of a void procedure -- has already applied
+         * its side effect to the Ladybug engine.  Raising an ERROR here
+         * would report a successful mutation as a failure and invite
+         * unsafe retries (see issue #6).  Report success instead:
+         *
+         *   - When the caller supplied a single TEXT column (the
+         *     conventional "AS t(ok text)" status shape), synthesize one
+         *     command-status row so the caller can confirm the command
+         *     completed.
+         *   - Otherwise, return zero rows: an honest empty result set,
+         *     not a false failure.
+         */
+        if (num_cols == 0)
+        {
+            lbug_query_result_destroy(&result);
+
+            if (natts == 1 &&
+                TupleDescAttr(tupdesc, 0)->atttypid == TEXTOID)
+            {
+                HeapTuple status_tuple;
+                Datum     values[1];
+                bool     nulls[1];
+
+                values[0] = CStringGetTextDatum("OK");
+                nulls[0] = false;
+                status_tuple = heap_form_tuple(tupdesc, values, nulls);
+                tuplestore_puttuple(ts, status_tuple);
+                heap_freetuple(status_tuple);
+                return 1;
+            }
+
+            return 0;
+        }
+
         if (err_msg)
             *err_msg = psprintf("ladybug: column count mismatch: query returns %d columns, expected %d",
                                 num_cols, natts);
@@ -815,6 +852,45 @@ ladybug_bridge_execute_collect(LadybugBridge *b,
 
     if (num_cols != natts)
     {
+        /*
+         * A successful statement that returns no result schema
+         * (num_cols == 0) -- e.g. a data CREATE/MERGE/DELETE without
+         * RETURN, or a CALL of a void procedure -- has already applied
+         * its side effect to the Ladybug engine.  Raising an ERROR here
+         * would report a successful mutation as a failure and invite
+         * unsafe retries (see issue #6).  Report success instead:
+         *
+         *   - When the caller supplied a single TEXT column (the
+         *     conventional "AS t(ok text)" status shape), synthesize one
+         *     command-status row so the caller can confirm the command
+         *     completed.
+         *   - Otherwise, return zero rows: an honest empty result set,
+         *     not a false failure.
+         */
+        if (num_cols == 0)
+        {
+            lbug_query_result_destroy(&result);
+
+            if (natts == 1 &&
+                TupleDescAttr(tupdesc, 0)->atttypid == TEXTOID)
+            {
+                HeapTuple status_tuple;
+                Datum     values[1];
+                bool      nulls[1];
+
+                values[0] = CStringGetTextDatum("OK");
+                nulls[0] = false;
+                status_tuple = heap_form_tuple(tupdesc, values, nulls);
+
+                *out_tuples = (HeapTuple *) palloc(sizeof(HeapTuple));
+                (*out_tuples)[0] = status_tuple;
+                return 1;
+            }
+
+            *out_tuples = NULL;
+            return 0;
+        }
+
         if (err_msg)
             *err_msg = psprintf("ladybug: column count mismatch: query returns %d columns, expected %d",
                                 num_cols, natts);
