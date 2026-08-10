@@ -20,6 +20,11 @@ jobs:
     name: 🐘 PostgreSQL ${{ matrix.pg }}
     runs-on: ubuntu-latest
     container: pgxn/pgxn-tools
+    env:
+      # Version of the pg_client extension fetched from
+      # https://extension.ladybugdb.com/<ver>/linux_amd64/pg_client/...
+      # Overridable via the workflow_dispatch `pg_client_version` input.
+      PG_CLIENT_VERSION: ${{ inputs.pg_client_version || '0.19.0' }}
     steps:
       - name: Start PostgreSQL ${{ matrix.pg }}
         run: pg-start ${{ matrix.pg }}
@@ -29,35 +34,14 @@ jobs:
         run: |
           mkdir -p lib
           LBUG_TARGET_DIR=$PWD/lib LBUG_LIB_KIND=shared bash scripts/download-liblbug.sh
-      - name: Test on PostgreSQL ${{ matrix.pg }}
-        run: pg-build-test
-  functional:
-    # Runs the full functional test suite (./scripts/test.sh) on Linux via
-    # pgembed: builds the extension against pgembed's bundled PostgreSQL,
-    # starts an embedded instance, and executes the SPI, bridge (library),
-    # Cypher, and replication tests.  Requires liblbug.so plus the pg_client
-    # extension next to it so the bridge can LOAD pg_client for ATTACH.
-    name: 🔬 Functional tests (./scripts/test.sh)
-    runs-on: ubuntu-latest
-    env:
-      # Version of the pg_client extension fetched from
-      # https://extension.ladybugdb.com/<ver>/linux_amd64/pg_client/...
-      # Overridable via the workflow_dispatch `pg_client_version` input.
-      PG_CLIENT_VERSION: ${{ inputs.pg_client_version || '0.19.0' }}
-    steps:
-      - name: Check out the repo
-        uses: actions/checkout@v4
-      - name: Set up uv (for pgembed + psycopg)
-        uses: astral-sh/setup-uv@v9
-      - name: Download liblbug (for Cypher planner)
-        run: |
-          mkdir -p lib
-          LBUG_TARGET_DIR=$PWD/lib LBUG_LIB_KIND=shared bash scripts/download-liblbug.sh
       - name: Download pg_client extension (for ATTACH)
         run: |
           # Placed next to liblbug.so so ladybug_bridge_attach_postgres()
           # can LOAD it when ATTACHing this Postgres to the Ladybug catalog.
           curl -fSL "https://extension.ladybugdb.com/v${PG_CLIENT_VERSION}/linux_amd64/pg_client/libpg_client.lbug_extension" -o lib/libpg_client.lbug_extension
-          ls -la lib/
-      - name: Run functional test suite
+      - name: Compile check on PostgreSQL ${{ matrix.pg }}
+        run: pg-build-test
+      - name: Set up uv (for pgembed + psycopg)
+        uses: astral-sh/setup-uv@v9.0.0
+      - name: Run functional test suite on PostgreSQL ${{ matrix.pg }}
         run: ./scripts/test.sh
