@@ -118,10 +118,11 @@ ladybug_bridge_acquire(const char **err_msg)
     storage_path_guc = GetConfigOptionByName("ladybug.storage_path", NULL, false);
     if (storage_path_guc != NULL && storage_path_guc[0] != '\0')
     {
+        const char *gerr = NULL;
+
         storage_path = pstrdup(storage_path_guc);
         storage_attempted = true;
 
-        const char *gerr = NULL;
         st = ladybug_guard_database_init(storage_path, cfg, &bridge.database, &gerr);
         if (st == 0)
         {
