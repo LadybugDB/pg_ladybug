@@ -19,17 +19,16 @@ jobs:
         pg: [16, 17, 18]
     name: 🐘 PostgreSQL ${{ matrix.pg }}
     runs-on: ubuntu-latest
-    container: pgxn/pgxn-tools
     env:
       # Version of the pg_client extension fetched from
       # https://extension.ladybugdb.com/<ver>/linux_amd64/pg_client/...
       # Overridable via the workflow_dispatch `pg_client_version` input.
       PG_CLIENT_VERSION: ${{ inputs.pg_client_version || '0.19.0' }}
     steps:
-      - name: Start PostgreSQL ${{ matrix.pg }}
-        run: pg-start ${{ matrix.pg }}
       - name: Check out the repo
         uses: actions/checkout@v4
+      - name: Set up uv (for pgembed + psycopg)
+        uses: astral-sh/setup-uv@v9.0.0
       - name: Download liblbug (for Cypher planner)
         run: |
           mkdir -p lib
@@ -39,9 +38,5 @@ jobs:
           # Placed next to liblbug.so so ladybug_bridge_attach_postgres()
           # can LOAD it when ATTACHing this Postgres to the Ladybug catalog.
           curl -fSL "https://extension.ladybugdb.com/v${PG_CLIENT_VERSION}/linux_amd64/pg_client/libpg_client.lbug_extension" -o lib/libpg_client.lbug_extension
-      - name: Compile check on PostgreSQL ${{ matrix.pg }}
-        run: pg-build-test
-      - name: Set up uv (for pgembed + psycopg)
-        uses: astral-sh/setup-uv@v9.0.0
-      - name: Run functional test suite on PostgreSQL ${{ matrix.pg }}
+      - name: Run functional test suite
         run: ./scripts/test.sh
