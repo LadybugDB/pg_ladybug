@@ -2,3 +2,4 @@ lib/
 *.o
 *.so
 *.bc
+*.dylib

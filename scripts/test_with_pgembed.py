@@ -30,8 +30,17 @@ def main() -> int:
     print("=== Building pg_ladybug with", _pg_config, "===")
     env_build = os.environ.copy()
     env_build["PG_CONFIG"] = _pg_config
-    subprocess.run(["make", "clean"], cwd=repo_root, capture_output=True, text=True, env=env_build)
-    result = subprocess.run(["make"], cwd=repo_root, capture_output=True, text=True, env=env_build)
+    # Forward CC / PG_SYSROOT from the environment onto the make command line
+    # (command-line make vars override PGXS' `=` assignments; plain env vars
+    # do not).  This lets a builder select a specific compiler and/or repair a
+    # stale -isysroot baked into a bundled pg_config after an Xcode upgrade.
+    make_overrides = []
+    for var in ("CC", "PG_SYSROOT"):
+        val = env_build.get(var)
+        if val:
+            make_overrides.append(f"{var}={val}")
+    subprocess.run(["make", "clean", *make_overrides], cwd=repo_root, capture_output=True, text=True, env=env_build)
+    result = subprocess.run(["make", *make_overrides], cwd=repo_root, capture_output=True, text=True, env=env_build)
     if result.returncode != 0:
         print("Build FAILED:", result.stderr)
         return 1
@@ -49,7 +58,15 @@ def main() -> int:
     # ---- Install pg_ladybug into the embedded PG ----
     pg_lib_dir = _pgembed_dir / "lib" / "postgresql"
     pg_share_dir = _pgembed_dir / "share" / "postgresql" / "extension"
-    shutil.copy(repo_root / "pg_ladybug.so", pg_lib_dir / "pg_ladybug.so")
+    # The shared library suffix is platform-dependent (.so on Linux,
+    # .dylib on macOS); pick up whichever the build actually produced.
+    shlib_path = next((repo_root / f"pg_ladybug.{ext}"
+                       for ext in ("so", "dylib")
+                       if (repo_root / f"pg_ladybug.{ext}").exists()), None)
+    if shlib_path is None:
+        print("Build FAILED: pg_ladybug shared library not found")
+        return 1
+    shutil.copy(shlib_path, pg_lib_dir / shlib_path.name)
     shutil.copy(repo_root / "pg_ladybug--1.0.sql", pg_share_dir / "pg_ladybug--1.0.sql")
     shutil.copy(repo_root / "pg_ladybug.control", pg_share_dir / "pg_ladybug.control")
     print("Extension files installed")
@@ -132,6 +149,8 @@ def main() -> int:
             socket_dir = query.get("host", ["/tmp"])[0]
 
             env = os.environ.copy()
+            # Ensure the embedded PG's client binaries (psql) are on PATH.
+            env["PATH"] = f"{_pgembed_dir / 'bin'}{os.pathsep}{env.get('PATH', '')}"
             env["PGHOST"] = socket_dir
             env["PGPORT"] = "5432"
             env["PGUSER"] = "ci"

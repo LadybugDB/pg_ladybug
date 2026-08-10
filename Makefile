@@ -6,6 +6,10 @@ EXTENSION = pg_ladybug
 DATA = pg_ladybug--1.0.sql
 OBJS = $(WIN32RES) pg_ladybug.o ladybug_bridge.o
 PG_CPPFLAGS = -I.
+# Search the vendored lib/ *before* any system liblbug (PG_LDFLAGS is
+# prepended to LDFLAGS by PGXS, so it wins over -L paths baked into pg_config,
+# e.g. an older liblbug installed under /opt/homebrew/lib).
+PG_LDFLAGS = -L$(CURDIR)/lib
 SHLIB_LINK = -L$(CURDIR)/lib -llbug -Wl,-rpath,$(CURDIR)/lib
 PG_CONFIG ?= pg_config
 
