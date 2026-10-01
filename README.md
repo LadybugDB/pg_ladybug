@@ -25,7 +25,7 @@ We also support a second mode: run Cypher only queries that don't access Postgre
 
 - **PostgreSQL 17+** (tested on 17 and 18)
 - **pg_config** (postgresql-server-dev package)
-- **`liblbug.so` v0.21.2+** (Ladybug engine shared library; see Installation)
+- **`liblbug.so` v0.19.0+** (Ladybug engine shared library; see Installation)
 - **`libpg_client.lbug_extension`** (pg_client extension for ATTACH; see Installation)
 - **OpenSSL** (liblbug requires `libssl`/`libcrypto`)
 
@@ -33,10 +33,10 @@ We also support a second mode: run Cypher only queries that don't access Postgre
 
 ### 1. Download liblbug and pg_client
 
-You need **liblbug v0.21.2 or later** and the **pg_client extension** (v0.21.0+).
+You need **liblbug v0.19.0 or later** and the **pg_client extension**.
 
 ```bash
-# Download liblbug v0.21.2 (shared library)
+# Download liblbug v0.19.0 (shared library)
 # Set LBUG_VERSION or use a nightly build RUN_ID
 export LBUG_PRECOMPILED_RUN_ID=<run_id>
 export LBUG_TARGET_DIR=./lib
@@ -52,8 +52,8 @@ The `lib/` directory should contain:
 ```
 lib/
 ├── liblbug.so -> liblbug.so.0
-├── liblbug.so.0 -> liblbug.so.0.21.2
-├── liblbug.so.0.21.2
+├── liblbug.so.0 -> liblbug.so.0.19.0.*
+├── liblbug.so.0.19.0.*
 └── libpg_client.lbug_extension
 ```
 
@@ -237,15 +237,7 @@ via libpq, making it compatible with all PostgreSQL versions.
 
 ## Updating liblbug
 
-This repo currently targets **liblbug 0.21.2** with **pg_client 0.21.0**
-(pg_client tracks the Ladybug minor line, so 0.21.0 pairs with liblbug
-0.21.x) and **Icebug 13.2** for data-science / Icebug-disk workflows.
-
 ```bash
-# Download a pinned release
-LBUG_VERSION=0.21.2 LBUG_TARGET_DIR=./lib LBUG_LIB_KIND=shared bash scripts/download-liblbug.sh
-curl -fSL "https://extension.ladybugdb.com/v0.21.0/linux_amd64/pg_client/libpg_client.lbug_extension" -o lib/libpg_client.lbug_extension
-
 # Download a specific nightly build
 export LBUG_PRECOMPILED_RUN_ID=<run_id>
 bash scripts/download-liblbug.sh
