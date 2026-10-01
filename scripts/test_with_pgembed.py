@@ -144,18 +144,21 @@ def main() -> int:
                     cur.execute("SELECT * FROM ladybug._graph_meta")
                     print("Graph meta:", cur.fetchall())
 
-                    # Create fkrel_knows table for MATCH-with-relationship tests
+                    # Create rel_knows table for MATCH-with-relationship tests
+                    # (rel_* prefix: required by pg_client 0.21.0+ to expose
+                    # the table as a relationship; bare FK tables like the
+                    # old fkrel_knows name are no longer picked up.)
                     cur.execute("""
-                        CREATE TABLE fkrel_knows (
+                        CREATE TABLE rel_knows (
                             id INT PRIMARY KEY,
                             src_id INT NOT NULL,
                             dst_id INT NOT NULL,
                             since TEXT
                         )
                     """)
-                    cur.execute("ALTER TABLE fkrel_knows ADD CONSTRAINT fk_src FOREIGN KEY (src_id) REFERENCES node_person(id)")
-                    cur.execute("ALTER TABLE fkrel_knows ADD CONSTRAINT fk_dst FOREIGN KEY (dst_id) REFERENCES node_person(id)")
-                    cur.execute("INSERT INTO fkrel_knows VALUES "
+                    cur.execute("ALTER TABLE rel_knows ADD CONSTRAINT fk_src FOREIGN KEY (src_id) REFERENCES node_person(id)")
+                    cur.execute("ALTER TABLE rel_knows ADD CONSTRAINT fk_dst FOREIGN KEY (dst_id) REFERENCES node_person(id)")
+                    cur.execute("INSERT INTO rel_knows VALUES "
                                 "(1, 1, 2, '2020-01-15'), (2, 1, 3, '2021-03-20'), "
                                 "(3, 2, 4, '2022-06-10'), (4, 3, 4, '2023-08-05')")
 
@@ -334,25 +337,28 @@ def main() -> int:
                                               and "Bob" not in o and "Dave" not in o))
 
             # ================================================================
-            # Test: MATCH with relationship (fkrel table join) - similar to
+            # Test: MATCH with relationship (rel table join) - similar to
             # pg_client test 06b. The planner translates the pattern
             # (a)-[k]->(b) into a SQL JOIN that is executed via SPI.
+            # NOTE: the count test wraps a projection (not RETURN count(*))
+            # because the 0.21 planner pushes COUNT(*) down to a single-row
+            # aggregate; counting the projected join rows is what asserts
+            # the 4 relationships are matched.
             # ================================================================
-            run_test("Cypher: MATCH with fkrel relationship (count)",
+            run_test("Cypher: MATCH with rel relationship (count)",
                      f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
                      "SELECT count(*)::int AS cnt FROM ladybug.cypher("
-                     "'MATCH (a:node_person)-[k:fkrel_knows]->(b:node_person) RETURN count(*)'"
-                     ") AS t(cnt int)",
+                     "'MATCH (a:node_person)-[k:rel_knows]->(b:node_person) RETURN a.name, b.name'"
+                     ") AS t(a text, b text)",
                      env, check=lambda o, e: "4" in o)
 
-            run_test("Cypher: MATCH with fkrel relationship (projection)",
+            run_test("Cypher: MATCH with rel relationship (projection)",
                      f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
                      "SELECT * FROM ladybug.cypher("
-                     "'MATCH (a:node_person)-[k:fkrel_knows]->(b:node_person) RETURN a.name, b.name, k.since'"
+                     "'MATCH (a:node_person)-[k:rel_knows]->(b:node_person) RETURN a.name, b.name, k.since'"
                      ") AS t(a_name text, b_name text, since text) ORDER BY a_name",
                      env,
-                     check=lambda o, e: ("Alice" in o and "Bob" in o and "2020-01-15" in o),
-                     xfail_reason="relationship column projection returns empty values; fixed in unreleased ladybug")
+                     check=lambda o, e: ("Alice" in o and "Bob" in o and "2020-01-15" in o))
 
             # ================================================================
             # Declarative replication tests (Postgres -> Ladybug)
