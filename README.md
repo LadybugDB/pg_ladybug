@@ -136,13 +136,18 @@ used by the SQL extraction layer.
 Tables with the following prefixes are automatically recognized by the
 pg_client extension:
 
-| Prefix | Cypher role  | Example       |
-|--------|--------------|---------------|
-| `node_`| Node label   | `node_person` |
-| `rel_` | Relationship | `rel_knows`   |
+| Prefix      | Cypher role           | Example       |
+|-------------|-----------------------|---------------|
+| `node_`     | Node label            | `node_person` |
+| `rel_`      | Relationship          | `rel_knows`   |
+| `csr_rel_`  | Relationship (CSR)    | —             |
 
-For `rel_*` tables, the source and destination node tables are determined by
-foreign key constraints on `src_id` and `dst_id` columns.
+For `rel_*` tables (foreign-key-backed, scan-driven relationship tables), the
+source and destination node tables are determined by foreign key constraints
+against the corresponding `node_*` tables. The `csr_rel_` prefix is reserved
+for attach-time materialization into a local on-disk CSR rel table (not
+implemented yet; currently routed through the same scan-driven path as
+`rel_*`).
 
 You can also register tables manually using `ladybug.register_node()` and
 `ladybug.register_edge()`.

@@ -128,8 +128,9 @@ SELECT '=== in-place query tests (conditional on liblbug) ===' AS info;
 
 /*
  * These tests use the naming convention:
- *   node_*  -> Cypher node labels
- *   rel_*   -> Cypher relationship labels
+ *   node_*     -> Cypher node labels
+ *   rel_*      -> Cypher relationship labels (FK-backed, scan-driven)
+ *   csr_rel_*  -> reserved for CSR-materialized rel tables (not used here)
  *
  * They work with the existing bridge by:
  * 1. ATTACHing Postgres via the Ladybug postgres extension
