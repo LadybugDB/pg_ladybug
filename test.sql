@@ -146,11 +146,17 @@ SELECT '=== in-place query tests (conditional on liblbug) ===' AS info;
  * queries from the SCAN_NODE_TABLE sections.
  */
 
+-- SQL-pushdown patterns below mirror upstream 0.21.2 suite:
+-- extensions/duckdb/test/test_files/sql_pushdown.test
+--
 -- The following tests use pre-existing tables in ladybug_test:
---   node_person (id, name, age)
---   node_city   (id, name, population)
---   rel_knows   (id, src_id, dst_id, since)
---   rel_lives_in (id, src_id, dst_id)
+--   node_person (id, name, age): Alice/35, Bob/25, Carol/45, Dave/28
+--   node_city   (id, name): NYC, SF
+--   rel_knows   (id, src_id, dst_id, since): Alice->Bob/2020,
+--     Bob->Carol/2021, Alice->Carol/2019, Carol->Dave/2022
+--   rel_likes   (id, src_id, dst_id, score): Alice->Bob/5,
+--     Bob->Carol/8, Carol->Dave/3
+--   rel_livesin (id, src_id, dst_id): Alice->NYC, Bob->SF, Carol->NYC
 
 DO $$
 DECLARE
@@ -204,6 +210,79 @@ BEGIN
         RAISE NOTICE 'rel_knows pattern MATCH returned % rows', result_count;
     EXCEPTION WHEN OTHERS THEN
         RAISE NOTICE 'rel_knows pattern MATCH skipped (requires rel_* extension support): %', SQLERRM;
+    END;
+
+    -- Two-hop with node filter (upstream TwoHopNodeFilterPushdown, expect 2)
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (a:node_person)-[r1:rel_knows]->(b:node_person)-[r2:rel_likes]->(c:node_person) WHERE a.age > 30 RETURN a.name, b.name, c.name'
+            ) AS t(a text, b text, c text)
+        $q$ INTO result_count;
+        RAISE NOTICE 'two-hop node-filter MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'two-hop node-filter MATCH skipped: %', SQLERRM;
+    END;
+
+    -- Two-hop with edge filters (upstream TwoHopEdgeFilterPushdown, expect 1)
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (a:node_person)-[r1:rel_knows]->(b:node_person)-[r2:rel_likes]->(c:node_person) WHERE r1.since >= 2020 AND r2.score > 4 RETURN a.name, c.name'
+            ) AS t(a text, c text)
+        $q$ INTO result_count;
+        RAISE NOTICE 'two-hop edge-filter MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'two-hop edge-filter MATCH skipped: %', SQLERRM;
+    END;
+
+    -- Two-hop mixed node labels person->city (upstream, expect 3)
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (a:node_person)-[r1:rel_knows]->(b:node_person)-[r2:rel_livesin]->(c:node_city) RETURN a.name, c.name'
+            ) AS t(a text, c text)
+        $q$ INTO result_count;
+        RAISE NOTICE 'two-hop mixed-label MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'two-hop mixed-label MATCH skipped: %', SQLERRM;
+    END;
+
+    -- Aggregation with ORDER BY (upstream AggregationOrderByPushdown,
+    -- expect 3 groups: Alice|2, Bob|1, Carol|1)
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (a:node_person)-[r:rel_knows]->(b:node_person) RETURN a.name, count(*) AS cnt ORDER BY cnt DESC, a.name'
+            ) AS t(a text, cnt bigint)
+        $q$ INTO result_count;
+        RAISE NOTICE 'aggregation ORDER BY MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'aggregation ORDER BY MATCH skipped: %', SQLERRM;
+    END;
+
+    -- Recursive variable-length path (upstream RecursiveCTEPushdown, expect 8)
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (a:node_person)-[e:rel_knows*1..3]->(b:node_person) RETURN b.name'
+            ) AS t(b text)
+        $q$ INTO result_count;
+        RAISE NOTICE 'recursive path MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'recursive path MATCH skipped: %', SQLERRM;
+    END;
+
+    -- Recursive path with edge filter (upstream, expect 1: Bob)
+    BEGIN
+        EXECUTE $q$
+            SELECT count(*)::int FROM ladybug.cypher(
+                'MATCH (a:node_person)-[e:rel_knows*1..2 {since: 2020}]->(b:node_person) RETURN b.name'
+            ) AS t(b text)
+        $q$ INTO result_count;
+        RAISE NOTICE 'recursive edge-filter MATCH returned % rows', result_count;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'recursive edge-filter MATCH skipped: %', SQLERRM;
     END;
 END $$;
 

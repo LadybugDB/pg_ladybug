@@ -136,9 +136,17 @@ def main() -> int:
                 with conn.cursor() as cur:
                     cur.execute("CREATE EXTENSION pg_ladybug")
                     print("Extension created")
+                    # Fixture mirrors upstream sql_pushdown.test (extensions repo):
+                    # node_person Alice/35, Bob/25, Carol/45, Dave/28;
+                    # node_city NYC(10), SF(11); rel_knows Alice->Bob/2020,
+                    # Bob->Carol/2021, Alice->Carol/2019, Carol->Dave/2022;
+                    # rel_likes Alice->Bob/5, Bob->Carol/8, Carol->Dave/3;
+                    # rel_livesin Alice->NYC, Bob->SF, Carol->NYC.
                     cur.execute("CREATE TABLE node_person (id INT PRIMARY KEY, name TEXT, age INT)")
                     cur.execute("INSERT INTO node_person VALUES "
-                                "(1, 'Alice', 30), (2, 'Bob', 25), (3, 'Carol', 35), (4, 'Dave', 28)")
+                                "(1, 'Alice', 35), (2, 'Bob', 25), (3, 'Carol', 45), (4, 'Dave', 28)")
+                    cur.execute("CREATE TABLE node_city (id INT PRIMARY KEY, name TEXT)")
+                    cur.execute("INSERT INTO node_city VALUES (10, 'NYC'), (11, 'SF')")
                     # Register label -> table mapping
                     cur.execute("SELECT ladybug.register_node('Person', 'node_person', 'id')")
                     cur.execute("SELECT * FROM ladybug._graph_meta")
@@ -153,14 +161,37 @@ def main() -> int:
                             id INT PRIMARY KEY,
                             src_id INT NOT NULL,
                             dst_id INT NOT NULL,
-                            since TEXT
+                            since INT
                         )
                     """)
                     cur.execute("ALTER TABLE rel_knows ADD CONSTRAINT fk_src FOREIGN KEY (src_id) REFERENCES node_person(id)")
                     cur.execute("ALTER TABLE rel_knows ADD CONSTRAINT fk_dst FOREIGN KEY (dst_id) REFERENCES node_person(id)")
                     cur.execute("INSERT INTO rel_knows VALUES "
-                                "(1, 1, 2, '2020-01-15'), (2, 1, 3, '2021-03-20'), "
-                                "(3, 2, 4, '2022-06-10'), (4, 3, 4, '2023-08-05')")
+                                "(1, 1, 2, 2020), (2, 2, 3, 2021), "
+                                "(3, 1, 3, 2019), (4, 3, 4, 2022)")
+                    cur.execute("""
+                        CREATE TABLE rel_likes (
+                            id INT PRIMARY KEY,
+                            src_id INT NOT NULL,
+                            dst_id INT NOT NULL,
+                            score INT
+                        )
+                    """)
+                    cur.execute("ALTER TABLE rel_likes ADD CONSTRAINT fk_likes_src FOREIGN KEY (src_id) REFERENCES node_person(id)")
+                    cur.execute("ALTER TABLE rel_likes ADD CONSTRAINT fk_likes_dst FOREIGN KEY (dst_id) REFERENCES node_person(id)")
+                    cur.execute("INSERT INTO rel_likes VALUES "
+                                "(1, 1, 2, 5), (2, 2, 3, 8), (3, 3, 4, 3)")
+                    cur.execute("""
+                        CREATE TABLE rel_livesin (
+                            id INT PRIMARY KEY,
+                            src_id INT NOT NULL,
+                            dst_id INT NOT NULL
+                        )
+                    """)
+                    cur.execute("ALTER TABLE rel_livesin ADD CONSTRAINT fk_livesin_src FOREIGN KEY (src_id) REFERENCES node_person(id)")
+                    cur.execute("ALTER TABLE rel_livesin ADD CONSTRAINT fk_livesin_dst FOREIGN KEY (dst_id) REFERENCES node_city(id)")
+                    cur.execute("INSERT INTO rel_livesin VALUES "
+                                "(1, 1, 10), (2, 2, 11), (3, 3, 10)")
 
             # Build environment for psql
             from urllib.parse import urlparse, parse_qs
@@ -282,13 +313,13 @@ def main() -> int:
                      f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
                      "SELECT * FROM ladybug.cypher('MATCH (n:node_person) RETURN n.name, n.age') "
                      "AS t(name text, age int) ORDER BY name",
-                     env, check=lambda o, e: "Alice" in o and "30" in o)
+                     env, check=lambda o, e: "Alice" in o and "35" in o)
 
             run_test("Cypher: MATCH with ORDER BY",
                      f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
                      "SELECT * FROM ladybug.cypher('MATCH (n:node_person) RETURN n.name, n.age ORDER BY n.age') "
                      "AS t(name text, age int)",
-                     env, check=lambda o, e: "25" in o and "30" in o and "35" in o)
+                     env, check=lambda o, e: ("25" in o and "28" in o and "35" in o and "45" in o))
 
             # ================================================================
             # Test 10b: cypher() fallback for queries without pushdown
@@ -356,9 +387,75 @@ def main() -> int:
                      f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
                      "SELECT * FROM ladybug.cypher("
                      "'MATCH (a:node_person)-[k:rel_knows]->(b:node_person) RETURN a.name, b.name, k.since'"
-                     ") AS t(a_name text, b_name text, since text) ORDER BY a_name",
+                     ") AS t(a_name text, b_name text, since int) ORDER BY a_name",
                      env,
-                     check=lambda o, e: ("Alice" in o and "Bob" in o and "2020-01-15" in o))
+                     check=lambda o, e: ("Alice" in o and "Bob" in o and "2020" in o))
+
+            # ============================================================
+            # SQL-pushdown patterns mirrored from upstream 0.21.2 suite:
+            # extensions/duckdb/test/test_files/sql_pushdown.test
+            # (OneHop, TwoHop node/edge-filter, mixed labels, aggregation
+            # + ORDER BY, recursive CTE, recursive edge filter). Every
+            # MATCH below runs over rel_* tables, which the local engine
+            # cannot traverse without pushdown, so each passing result
+            # proves the pattern was pushed to SQL.
+            # ============================================================
+            run_test("Pushdown: two-hop with node filter (a.age > 30)",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher("
+                     "'MATCH (a:node_person)-[r1:rel_knows]->(b:node_person)-[r2:rel_likes]->(c:node_person) "
+                     "WHERE a.age > 30 RETURN a.name, b.name, c.name ORDER BY a.name, b.name, c.name'"
+                     ") AS t(a_name text, b_name text, c_name text)",
+                     env,
+                     check=lambda o, e: ("Alice" in o and "Bob" in o and "Carol" in o and "Dave" in o))
+
+            run_test("Pushdown: two-hop with edge filters",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher("
+                     "'MATCH (a:node_person)-[r1:rel_knows]->(b:node_person)-[r2:rel_likes]->(c:node_person) "
+                     "WHERE r1.since >= 2020 AND r2.score > 4 RETURN a.name, c.name'"
+                     ") AS t(a_name text, c_name text)",
+                     env,
+                     check=lambda o, e: ("Alice" in o and "Carol" in o
+                                          and "Bob" not in o and "Dave" not in o))
+
+            run_test("Pushdown: two-hop mixed node labels (person->city)",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher("
+                     "'MATCH (a:node_person)-[r1:rel_knows]->(b:node_person)-[r2:rel_livesin]->(c:node_city) "
+                     "RETURN a.name, c.name ORDER BY a.name, c.name'"
+                     ") AS t(a_name text, c_name text)",
+                     env,
+                     check=lambda o, e: ("Alice" in o and "NYC" in o and "SF" in o
+                                          and "Bob" in o and "Dave" not in o))
+
+            run_test("Pushdown: aggregation with ORDER BY",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher("
+                     "'MATCH (a:node_person)-[r:rel_knows]->(b:node_person) "
+                     "RETURN a.name, count(*) AS cnt ORDER BY cnt DESC, a.name'"
+                     ") AS t(a_name text, cnt bigint)",
+                     env,
+                     check=lambda o, e: ("Alice" in o and "2" in o
+                                          and "Bob" in o and "Carol" in o
+                                          and "Dave" not in o))
+
+            run_test("Pushdown: recursive variable-length path (*1..3, count)",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT count(*)::int AS cnt FROM ladybug.cypher("
+                     "'MATCH (a:node_person)-[e:rel_knows*1..3]->(b:node_person) RETURN b.name'"
+                     ") AS t(b_name text)",
+                     env, check=lambda o, e: "8" in o)
+
+            run_test("Pushdown: recursive path with edge filter",
+                     f"SET ladybug.pg_connstr = '{libpq_connstr}'; "
+                     "SELECT * FROM ladybug.cypher("
+                     "'MATCH (a:node_person)-[e:rel_knows*1..2 {since: 2020}]->(b:node_person) "
+                     "RETURN b.name ORDER BY b.name'"
+                     ") AS t(b_name text)",
+                     env,
+                     check=lambda o, e: ("Bob" in o
+                                          and "Carol" not in o and "Dave" not in o))
 
             # ================================================================
             # Declarative replication tests (Postgres -> Ladybug)
