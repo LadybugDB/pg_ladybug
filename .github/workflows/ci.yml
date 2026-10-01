@@ -9,14 +9,16 @@ on:
   workflow_dispatch:
     inputs:
       pg_client_version:
-        description: 'pg_client extension version fetched from extension.ladybugdb.com (default: 0.19.0)'
+        description: 'pg_client extension version fetched from extension.ladybugdb.com (default: 0.21.0)'
         required: false
-        default: '0.19.0'
+        default: '0.21.0'
 env:
   # Version of the pg_client extension fetched from
   # https://extension.ladybugdb.com/<ver>/linux_amd64/pg_client/...
   # Overridable via the workflow_dispatch `pg_client_version` input.
-  PG_CLIENT_VERSION: ${{ inputs.pg_client_version || '0.19.0' }}
+  # Tracks the Ladybug minor line (0.21.x); patch releases share the
+  # minor-line pg_client build, so 0.21.0 pairs with liblbug 0.21.2.
+  PG_CLIENT_VERSION: ${{ inputs.pg_client_version || '0.21.0' }}
 jobs:
   test:
     # Per-version gate on real PostgreSQL servers via the official PGXN
